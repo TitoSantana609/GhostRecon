@@ -39,7 +39,7 @@ Each stage can load its input from the previous one, so a full sweep flows from 
 | amass | `sudo apt install amass` |
 | subfinder | `go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest` |
 | subfaster | `go install -v github.com/melvinsh/subfaster/v2/cmd/subfaster@latest` |
-| httpx | `go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest` |
+| httpx | `go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest` (see note) |
 | gau | `go install github.com/lc/gau/v2/cmd/gau@latest` |
 | waybackurls | `go install github.com/tomnomnom/waybackurls@latest` |
 | katana | `go install github.com/projectdiscovery/katana/cmd/katana@latest` |
@@ -48,6 +48,8 @@ Each stage can load its input from the previous one, so a full sweep flows from 
 | naabu | `go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest` |
 | nmap | `sudo apt install nmap` |
 | nuclei | `go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+
+> **httpx note:** the name `httpx` collides with the Python HTTP-client CLI (`python3-httpx`), which ships on some distros (e.g. Kali) at `/usr/bin/httpx`. GhostRecon detects ProjectDiscovery's httpx specifically and prefers `~/go/bin/httpx`, so both can coexist — just make sure the real one is installed.
 
 ## Usage
 

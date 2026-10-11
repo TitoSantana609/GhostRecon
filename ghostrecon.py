@@ -36,8 +36,9 @@ DOMAIN_RE = re.compile(
     r'(?:\.[A-Za-z0-9-]{1,63})+$'
 )
 HOST_RE = re.compile(
-    r'^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)'
-    r'(?:\.[A-Za-z0-9-]{1,63})*$'
+    # Allow leading underscore labels (CT surfaces names like _mta-sts, _dmarc)
+    r'^(?=.{1,253}$)(?!-)[A-Za-z0-9_-]{1,63}(?<!-)'
+    r'(?:\.[A-Za-z0-9_-]{1,63})*$'
 )
 IP_RE = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
 URL_RE = re.compile(r'^(https?://)?[A-Za-z0-9.-]+(:\d+)?(/\S*)?$')
@@ -561,7 +562,39 @@ class GhostReconGUI:
     }
 
     def has_tool(self, name):
+        # httpx is special: the name collides with the Python httpx HTTP client.
+        # Only count ProjectDiscovery's httpx (the recon tool) as present.
+        if name == "httpx":
+            return self.pd_httpx_path() is not None
         return shutil.which(name) is not None
+
+    _pd_httpx_cache = None  # None = unchecked, False = none found, str = path
+
+    def pd_httpx_path(self):
+        """Resolve ProjectDiscovery's httpx, skipping the Python httpx CLI shadow."""
+        if self._pd_httpx_cache is not None:
+            return self._pd_httpx_cache or None
+        candidates = [
+            os.path.expanduser("~/go/bin/httpx"),
+            os.path.expanduser("~/.local/bin/httpx"),
+            "/usr/local/bin/httpx",
+            shutil.which("httpx"),
+        ]
+        for path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                r = subprocess.run([path, "-version"], capture_output=True,
+                                   text=True, timeout=5)
+                blob = (r.stdout + r.stderr).lower()
+            except Exception:
+                continue
+            # Python httpx rejects -version ("no such option"); PD httpx prints a version.
+            if "no such option" not in blob and "usage: httpx [options]" not in blob:
+                self._pd_httpx_cache = path
+                return path
+        self._pd_httpx_cache = False
+        return None
 
     def require(self, widget, *tools):
         missing = [t for t in tools if not self.has_tool(t)]
@@ -790,7 +823,19 @@ class GhostReconGUI:
 
     def run_httpx(self, hosts):
         w = self.outputs["live"]
-        if not self.require(w, "httpx"):
+        httpx_bin = self.pd_httpx_path()
+        if not httpx_bin:
+            if shutil.which("httpx"):
+                self.append(w, "[!] The 'httpx' on PATH is the Python HTTP client, "
+                               "not ProjectDiscovery's recon tool.\n"
+                               "    Install the real one (goes to ~/go/bin, which "
+                               "GhostRecon checks first):\n"
+                               "    go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest\n"
+                               "    or use Settings → Install missing tools.\n")
+            else:
+                self.append(w, "[!] httpx not found. Install it via Settings → "
+                               "Install missing tools.\n")
+            self.update_status("ProjectDiscovery httpx not found.")
             return
         outdir = self.state["outdir"] or self._new_outdir(hosts[0])
         infile = os.path.join(outdir, "httpx_input.txt")
@@ -798,8 +843,8 @@ class GhostReconGUI:
             f.write("\n".join(hosts) + "\n")
         out = os.path.join(outdir, "live_hosts.txt")
         self.update_status(f"Probing {len(hosts)} hosts with httpx ...")
-        cmd = f"httpx -l {infile} -silent -status-code -title -tech-detect -o {out}"
-        self.run_stream(cmd, w, shell=True)
+        self.run_stream([httpx_bin, "-l", infile, "-silent", "-status-code",
+                         "-title", "-tech-detect", "-o", out], w)
         live = sorted(self._read_lines(out))
         # store bare hosts (strip http scheme + metadata) for downstream stages
         bare = sorted({re.sub(r'^https?://', '', ln.split(" ")[0]).split("/")[0]
