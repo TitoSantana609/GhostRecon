@@ -43,13 +43,15 @@ Each stage can load its input from the previous one, so a full sweep flows from 
 | gau | `go install github.com/lc/gau/v2/cmd/gau@latest` |
 | waybackurls | `go install github.com/tomnomnom/waybackurls@latest` |
 | katana | `go install github.com/projectdiscovery/katana/cmd/katana@latest` |
-| gf | `go install github.com/tomnomnom/gf@latest` |
+| gf | `go install github.com/tomnomnom/gf@latest` (see note) |
 | uro | `pipx install uro` |
 | naabu | `go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest` |
 | nmap | `sudo apt install nmap` |
 | nuclei | `go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
 
 > **httpx note:** the name `httpx` collides with the Python HTTP-client CLI (`python3-httpx`), which ships on some distros (e.g. Kali) at `/usr/bin/httpx`. GhostRecon detects ProjectDiscovery's httpx specifically and prefers `~/go/bin/httpx`, so both can coexist — just make sure the real one is installed.
+
+> **gf note:** `gf` installs with zero patterns — `gf xss` etc. only work once pattern files exist in `~/.config/gf` or `~/.gf`. GhostRecon fetches a pattern set (from [1ndianl33t/Gf-Patterns](https://github.com/1ndianl33t/Gf-Patterns)) into `~/.gf` automatically the first time the URLs stage runs `gf`. If that fails (no `git`, no network), install manually: `git clone https://github.com/1ndianl33t/Gf-Patterns ~/.gf`.
 
 ## Usage
 

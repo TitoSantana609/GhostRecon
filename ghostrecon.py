@@ -19,6 +19,8 @@ import re
 import threading
 import shutil
 import datetime
+import glob
+import tempfile
 
 try:
     import pyfiglet
@@ -596,6 +598,43 @@ class GhostReconGUI:
         self._pd_httpx_cache = False
         return None
 
+    GF_PATTERNS_REPO = "https://github.com/1ndianl33t/Gf-Patterns.git"
+
+    def gf_pattern_dir(self):
+        # Mirrors gf's own lookup (main.go: getPatternDir) so we check the
+        # exact directory it will read from, not just "~/.gf".
+        cfg = os.path.expanduser("~/.config/gf")
+        return cfg if os.path.isdir(cfg) else os.path.expanduser("~/.gf")
+
+    def ensure_gf_patterns(self, widget):
+        """gf installs with no patterns at all -- xss.json etc. must be fetched
+        separately, or every `gf <pattern>` call matches nothing and the
+        pipeline writes an empty (but valid) output file. Fetch them once."""
+        patdir = self.gf_pattern_dir()
+        if glob.glob(os.path.join(patdir, "*.json")):
+            return True
+        self.append(widget, f"[*] No gf patterns in {patdir} -- fetching a pattern set ...\n")
+        os.makedirs(patdir, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="gf-patterns-")
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", self.GF_PATTERNS_REPO, tmp],
+                check=True, capture_output=True, text=True, timeout=60)
+            for f in glob.glob(os.path.join(tmp, "*.json")):
+                shutil.copy(f, patdir)
+        except Exception as e:
+            self.append(widget,
+                f"[!] Could not fetch gf patterns automatically ({e}).\n"
+                f"    Install manually: git clone {self.GF_PATTERNS_REPO} {patdir}\n")
+            return False
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if glob.glob(os.path.join(patdir, "*.json")):
+            self.append(widget, f"[+] gf patterns installed to {patdir}\n")
+            return True
+        self.append(widget, f"[!] Pattern fetch ran but {patdir} is still empty.\n")
+        return False
+
     def require(self, widget, *tools):
         missing = [t for t in tools if not self.has_tool(t)]
         if missing:
@@ -895,13 +934,20 @@ class GhostReconGUI:
         self.append(w, f"\n[+] {len(all_urls)} unique URLs -> {combined}\n")
 
         pattern = self.gf_pattern.get()
-        if self.require(w, "gf", "uro"):
-            self.update_status(f"Filtering for {pattern} ...")
-            out = os.path.join(outdir, f"{pattern}.txt")
-            cmd = f"cat {combined} | gf {pattern} | uro | tee {out}"
-            self.append(w, f"\n--- gf {pattern} results ---\n")
-            self.run_stream(cmd, w, shell=True)
-            self.append(w, f"\n[+] Saved to {out}\n")
+        if self.require(w, "gf", "uro") and self.ensure_gf_patterns(w):
+            patfile = os.path.join(self.gf_pattern_dir(), f"{pattern}.json")
+            if not os.path.isfile(patfile):
+                self.append(w, f"[!] gf pattern '{pattern}' not found at {patfile} -- skipping.\n")
+            else:
+                self.update_status(f"Filtering for {pattern} ...")
+                out = os.path.join(outdir, f"{pattern}.txt")
+                cmd = f"cat {combined} | gf {pattern} | uro | tee {out}"
+                self.append(w, f"\n--- gf {pattern} results ---\n")
+                self.run_stream(cmd, w, shell=True)
+                if os.path.getsize(out) == 0:
+                    self.append(w, f"\n[*] 0 matches for '{pattern}' in this URL set (file saved, but empty).\n")
+                else:
+                    self.append(w, f"\n[+] Saved to {out}\n")
         self.update_status(f"URL recon done. Results in {outdir}")
 
     # ------------------------------------------------------------------ #
