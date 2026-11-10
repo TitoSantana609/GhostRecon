@@ -6,6 +6,7 @@ GhostRecon
 
 Pipeline:
     Subdomains -> Live Hosts (httpx) -> Ports / Vulns (nuclei) / URLs -> gf patterns
+                                     -> Dir busting (dirb + ffuf, merged)
 
 Each stage writes persistent results to:  results/<target>/<timestamp>/<tool>.txt
 and can pull its input from the previous stage.
@@ -21,6 +22,11 @@ import shutil
 import datetime
 import glob
 import tempfile
+import json
+import queue
+import random
+import string
+import time
 
 try:
     import pyfiglet
@@ -62,6 +68,57 @@ def sanitize_for_path(value):
     return re.sub(r'[^A-Za-z0-9._-]', '_', value).strip('_') or "target"
 
 
+ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+FFUF_NUM_RE = re.compile(r'^[0-9][0-9,\- ]*$')   # e.g. "404", "0-100,4242"
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub('', text)
+
+
+def parse_ranges(value):
+    """'200-299,301' -> [(200, 299), (301, 301)]"""
+    out = []
+    for part in value.replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        out.append((int(lo), int(hi or lo)))
+    return out
+
+
+def in_ranges(value, ranges):
+    return any(lo <= value <= hi for lo, hi in ranges)
+
+
+FFUF_DEFAULT_MC = "200-299,301,302,307,401,403,405,500"
+
+
+# --------------------------------------------------------------------------- #
+# Directory busting: wordlists + throttle presets
+# --------------------------------------------------------------------------- #
+# dirb's own standard list.
+DIRB_WORDLIST = "/usr/share/dirb/wordlists/common.txt"
+# ffuf: first one that exists wins. raft-medium-directories is the usual
+# best-balance pick (~30k entries, built from real-world crawl data).
+FFUF_WORDLISTS = [
+    "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+    "/usr/share/wordlists/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+    "/usr/share/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt",
+    "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
+    DIRB_WORDLIST,
+]
+# name -> (threads, max requests/sec (0 = unlimited), random jitter)
+THROTTLE_PRESETS = {
+    "Aggressive (no limit)": (40, 0, False),
+    "Normal": (20, 50, False),
+    "Polite": (5, 10, False),
+    "Stealth (WAF-safe)": (1, 2, True),
+}
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
 # --------------------------------------------------------------------------- #
 # Themes
 # --------------------------------------------------------------------------- #
@@ -91,6 +148,7 @@ class GhostReconGUI:
         self.run_buttons = []          # all buttons disabled during a scan
         self.active_output = None      # Text widget the current scan streams into
         self.current_proc = None       # running subprocess (for Stop)
+        self.stop_requested = False    # lets multi-target loops bail out on Stop
 
         # shared pipeline state (results carried between tabs)
         self.state = {
@@ -98,7 +156,9 @@ class GhostReconGUI:
             "outdir": None,
             "subdomains": [],
             "live_hosts": [],
+            "live_urls": [],           # httpx results with scheme (http/https)
             "urls": [],
+            "dirs": [],                # merged dirb + ffuf findings
         }
 
         # Make sure go/pip user bin dirs are visible so freshly-installed tools resolve
@@ -127,7 +187,7 @@ class GhostReconGUI:
         ttk.Label(self.welcome_frame, text="👻 GhostRecon",
                   font=("Helvetica", 30, "bold")).grid(row=1, column=0, pady=(0, 6))
         ttk.Label(self.welcome_frame,
-                  text="Subdomains · Live Hosts · Ports · URLs · Vulnerabilities",
+                  text="Subdomains · Live Hosts · URLs · Ports · Vulns · Dir Busting",
                   font=("Helvetica", 12)).grid(row=2, column=0, pady=(0, 20))
 
         start = ttk.Button(self.welcome_frame, text="Start",
@@ -157,6 +217,11 @@ class GhostReconGUI:
         settings = tk.Menu(menubar, tearoff=0)
         settings.add_command(label="Install missing tools…",
                              command=self.open_install_dialog)
+        settings.add_separator()
+        settings.add_command(label="Update nuclei engine…",
+                             command=self.update_nuclei_engine)
+        settings.add_command(label="Update nuclei templates…",
+                             command=self.update_nuclei_templates)
         menubar.add_cascade(label="Settings", menu=settings)
         self.master.config(menu=menubar)
 
@@ -177,6 +242,7 @@ class GhostReconGUI:
         self._build_url_tab()
         self._build_port_tab()
         self._build_vuln_tab()
+        self._build_dirbust_tab()
 
         # Bottom control/status bar
         bottom = ttk.Frame(self.master, padding=(8, 4))
@@ -337,6 +403,281 @@ class GhostReconGUI:
 
         self.outputs["vuln"] = self._make_output(tab)
 
+    # --- Tab: Directory busting (dirb + ffuf) ---------------------------- #
+    def _build_dirbust_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="6. Dir Busting")
+        tab.columnconfigure(0, weight=1)
+
+        ttk.Label(tab, text="Target URLs (one per line, or use live hosts):"
+                  ).grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(5, 0))
+        self.dirbust_input = tk.Text(tab, height=3, wrap=tk.NONE, font=("Courier New", 10))
+        self.dirbust_input.grid(row=1, column=0, columnspan=4, sticky="ew", padx=5, pady=5)
+
+        row2 = ttk.Frame(tab)
+        row2.grid(row=2, column=0, columnspan=4, sticky="ew", padx=5)
+        ttk.Button(row2, text="Load live hosts from stage 2",
+                   command=self._load_live_urls).pack(side="left")
+        self.db_use_dirb = tk.BooleanVar(value=True)
+        self.db_use_ffuf = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text="dirb", variable=self.db_use_dirb).pack(side="left", padx=(16, 4))
+        ttk.Checkbutton(row2, text="ffuf", variable=self.db_use_ffuf).pack(side="left", padx=4)
+        btn = ttk.Button(row2, text="Bust directories", command=self.start_dirbust)
+        btn.pack(side="right")
+        self.run_buttons.append(btn)
+
+        # Wordlists
+        wl = ttk.LabelFrame(tab, text="Wordlists", padding=6)
+        wl.grid(row=3, column=0, columnspan=4, sticky="ew", padx=5, pady=(6, 0))
+        wl.columnconfigure(1, weight=1)
+        self.dirb_wordlist = tk.StringVar(value=DIRB_WORDLIST)
+        self.ffuf_wordlist = tk.StringVar(value=self.best_ffuf_wordlist() or "")
+        for r, (label, var) in enumerate((("dirb:", self.dirb_wordlist),
+                                          ("ffuf:", self.ffuf_wordlist))):
+            ttk.Label(wl, text=label).grid(row=r, column=0, sticky="w")
+            ttk.Entry(wl, textvariable=var).grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+            ttk.Button(wl, text="Browse…",
+                       command=lambda v=var: self._browse_wordlist(v)
+                       ).grid(row=r, column=2, pady=1)
+
+        opts = ttk.Frame(tab)
+        opts.grid(row=4, column=0, columnspan=4, sticky="ew", padx=5, pady=(6, 0))
+        opts.columnconfigure(0, weight=1)
+        opts.columnconfigure(1, weight=1)
+
+        # ffuf filters: checkbox enables the flag, entry holds its value
+        flt = ttk.LabelFrame(opts, text="ffuf filters", padding=6)
+        flt.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.ffuf_filters = {}
+        specs = [
+            ("-ac", "Auto-calibrate (-ac)", None, True),
+            ("-mc", "Match codes (-mc)", "200-299,301,302,307,401,403,405,500", True),
+            ("-fc", "Filter codes (-fc)", "404", False),
+            ("-fs", "Filter size (-fs)", "", False),
+            ("-fw", "Filter words (-fw)", "", False),
+            ("-fl", "Filter lines (-fl)", "", False),
+            ("-fr", "Filter regex (-fr)", "", False),
+        ]
+        for i, (flag, label, default, on) in enumerate(specs):
+            # -ac alone on the first row, then the value filters two per row
+            r, c = (0, 0) if i == 0 else (1 + (i - 1) // 2, (i - 1) % 2)
+            cell = ttk.Frame(flt)
+            cell.grid(row=r, column=c, sticky="w", padx=(0, 10), pady=1)
+            var = tk.BooleanVar(value=on)
+            ttk.Checkbutton(cell, text=label, variable=var).pack(side="left")
+            val = None
+            if default is not None:
+                val = tk.StringVar(value=default)
+                ttk.Entry(cell, textvariable=val, width=14 if flag != "-mc" else 22
+                          ).pack(side="left", padx=(4, 0))
+            self.ffuf_filters[flag] = (var, val)
+
+        # Throttle / evasion
+        thr = ttk.LabelFrame(opts, text="Throttle", padding=6)
+        thr.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        ttk.Label(thr, text="Preset:").grid(row=0, column=0, sticky="w")
+        self.throttle_preset = ttk.Combobox(thr, state="readonly", width=20,
+                                            values=list(THROTTLE_PRESETS) + ["Custom"])
+        self.throttle_preset.grid(row=0, column=1, columnspan=3, sticky="w", padx=4, pady=1)
+        self.throttle_preset.bind("<<ComboboxSelected>>", self._apply_throttle_preset)
+
+        self.db_threads = tk.IntVar()
+        self.db_rate = tk.IntVar()
+        self.db_jitter = tk.BooleanVar()
+        ttk.Label(thr, text="Threads:").grid(row=1, column=0, sticky="w")
+        ttk.Spinbox(thr, from_=1, to=200, width=5, textvariable=self.db_threads,
+                    command=self._throttle_custom).grid(row=1, column=1, sticky="w", padx=4, pady=1)
+        ttk.Label(thr, text="Max req/s (0 = no limit):").grid(row=1, column=2, sticky="w")
+        ttk.Spinbox(thr, from_=0, to=1000, width=5, textvariable=self.db_rate,
+                    command=self._throttle_custom).grid(row=1, column=3, sticky="w", padx=4, pady=1)
+        ttk.Checkbutton(thr, text="Random delay jitter (ffuf -p 0.1-1.0)",
+                        variable=self.db_jitter, command=self._throttle_custom
+                        ).grid(row=2, column=0, columnspan=4, sticky="w")
+        self.db_browser_ua = tk.BooleanVar(value=True)
+        ttk.Checkbutton(thr, text="Browser User-Agent (tool UAs are often WAF-blocked)",
+                        variable=self.db_browser_ua).grid(row=3, column=0, columnspan=4, sticky="w")
+        self.db_recursive = tk.BooleanVar(value=False)
+        ttk.Checkbutton(thr, text="Recurse into found dirs (multiplies requests)",
+                        variable=self.db_recursive).grid(row=4, column=0, columnspan=4, sticky="w")
+        self.throttle_preset.set("Polite")
+        self._apply_throttle_preset()
+
+        # Results (merged dirb + ffuf) above the live log, resizable split
+        paned = ttk.PanedWindow(tab, orient=tk.VERTICAL)
+        paned.grid(row=10, column=0, columnspan=4, sticky="nsew", padx=5, pady=5)
+        tab.grid_rowconfigure(10, weight=1)
+
+        res = ttk.Frame(paned)
+        res.columnconfigure(0, weight=1)
+        res.rowconfigure(1, weight=1)
+        self.dirbust_summary = ttk.Label(res, text="Combined results (dirb + ffuf) — "
+                                                   "double-click a row to copy its URL")
+        self.dirbust_summary.grid(row=0, column=0, columnspan=2, sticky="w")
+        cols = ("url", "status", "size", "found_by")
+        self.dirbust_tree = ttk.Treeview(res, columns=cols, show="headings", height=8)
+        for col, label, width, stretch in (("url", "URL", 460, True),
+                                           ("status", "Status", 70, False),
+                                           ("size", "Size", 80, False),
+                                           ("found_by", "Found by", 110, False)):
+            self.dirbust_tree.heading(col, text=label,
+                                      command=lambda c=col: self._sort_dirbust(c, False))
+            self.dirbust_tree.column(col, width=width, stretch=stretch,
+                                     anchor="w" if col == "url" else "center")
+        self.dirbust_tree.grid(row=1, column=0, sticky="nsew")
+        tsb = ttk.Scrollbar(res, command=self.dirbust_tree.yview)
+        tsb.grid(row=1, column=1, sticky="ns")
+        self.dirbust_tree["yscrollcommand"] = tsb.set
+        self.dirbust_tree.bind("<Double-1>", self._copy_dirbust_url)
+        paned.add(res, weight=1)
+
+        # Live feed: every word tested, with its response code + size
+        live = ttk.Frame(paned)
+        live.rowconfigure(1, weight=1)
+        live.columnconfigure(0, weight=1)
+        self.live_status = ttk.Label(live, text="Live requests — idle")
+        self.live_status.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.live_feed = tk.Text(live, wrap=tk.NONE, state="disabled", height=7,
+                                 font=("Courier New", 10), relief=tk.FLAT, bd=0)
+        self.live_feed.grid(row=1, column=0, sticky="nsew")
+        fsb = ttk.Scrollbar(live, command=self.live_feed.yview)
+        fsb.grid(row=1, column=1, sticky="ns")
+        self.live_feed["yscrollcommand"] = fsb.set
+        for tag, color in (("2xx", "#3fb950"), ("3xx", "#58a6ff"), ("4xx", "#8b949e"),
+                           ("5xx", "#f85149"), ("err", "#d29922")):
+            self.live_feed.tag_configure(tag, foreground=color)
+        self.live_feed.tag_configure("hit", font=("Courier New", 10, "bold"))
+        paned.add(live, weight=1)
+        self._feed_q = queue.Queue()
+        self._feed = {"tool": None}
+        self.master.after(150, self._drain_feed)
+
+        log = ttk.Frame(paned)
+        log.rowconfigure(0, weight=1)
+        log.columnconfigure(0, weight=1)
+        text = tk.Text(log, wrap=tk.WORD, state="disabled", height=6,
+                       font=("Courier New", 10), relief=tk.FLAT, bd=0)
+        text.grid(row=0, column=0, sticky="nsew")
+        lsb = ttk.Scrollbar(log, command=text.yview)
+        lsb.grid(row=0, column=1, sticky="ns")
+        text["yscrollcommand"] = lsb.set
+        paned.add(log, weight=1)
+        self.outputs["dir"] = text
+
+    # Live feed plumbing: workers push into a queue, the Tk loop drains it in
+    # batches (a fast scan can do hundreds of req/s -- one Tk call per line
+    # would freeze the window).
+    FEED_MAX_LINES = 500
+
+    def _feed_begin(self, tool, target, total):
+        self._feed = {"tool": tool, "target": target, "total": total, "tested": 0,
+                      "hits": 0, "last": "", "t0": time.time(), "rate": 0.0,
+                      "rt": time.time(), "rn": 0}
+
+    def _feed_push(self, path, code, size, hit):
+        f = self._feed
+        f["tested"] += 1
+        f["hits"] += hit
+        f["last"] = f"{path} [{code}] {size}B"
+        self._feed_q.put((path, code, size, hit))
+
+    def _drain_feed(self):
+        try:
+            items = []
+            while len(items) < 5000:
+                items.append(self._feed_q.get_nowait())
+        except queue.Empty:
+            pass
+        if items:
+            fw = self.live_feed
+            fw.config(state="normal")
+            for path, code, size, hit in items[-self.FEED_MAX_LINES:]:
+                c = str(code)
+                tag = f"{c[0]}xx" if c[:1] in "2345" and c.isdigit() else "err"
+                line = f"{path[:70]:<70} [{c:>3}] {str(size):>9} B"
+                fw.insert(tk.END, line + ("   <-- HIT\n" if hit else "\n"),
+                          (tag, "hit") if hit else (tag,))
+            excess = int(fw.index("end-1c").split(".")[0]) - self.FEED_MAX_LINES
+            if excess > 0:
+                fw.delete("1.0", f"{excess + 1}.0")
+            fw.see(tk.END)
+            fw.config(state="disabled")
+        f = self._feed
+        if f.get("tool"):
+            now = f.get("t_end") or time.time()
+            if f.get("done") and not f.get("t_end"):
+                f["t_end"] = now   # final figure = average over the whole run
+                f["rate"] = f["tested"] / max(now - f["t0"], 0.001)
+            if not f.get("done") and now - f["rt"] >= 1.0:   # req/s over the last ~second
+                f["rate"] = (f["tested"] - f["rn"]) / (now - f["rt"])
+                f["rt"], f["rn"] = now, f["tested"]
+            total = f["total"]
+            pct = f" ({100 * f['tested'] // total}%)" if total else ""
+            el = int(now - f["t0"])
+            self.live_status.config(text=(
+                f"{'FINISHED  ' if f.get('done') else ''}{f['tool']} -> {f['target']}   tested {f['tested']}/{total or '?'}{pct}"
+                f"   {f['rate']:.1f} req/s   hits {f['hits']}   {el // 60}:{el % 60:02d}"
+                f"   last: {f['last']}"))
+        self.master.after(150, self._drain_feed)
+
+    @staticmethod
+    def _count_words(path):
+        try:
+            with open(path, errors="replace") as fh:
+                return sum(1 for ln in fh if ln.strip() and not ln.startswith("#"))
+        except OSError:
+            return 0
+
+    def _load_live_urls(self):
+        # Prefer httpx URLs (keep the real scheme); fall back to bare hosts.
+        items = self.state.get("live_urls") or self.state.get("live_hosts")
+        if not items:
+            messagebox.showinfo("No data", "No live hosts available yet. Run stage 2 first.")
+            return
+        self.dirbust_input.delete("1.0", tk.END)
+        self.dirbust_input.insert("1.0", "\n".join(items))
+
+    def _browse_wordlist(self, var):
+        start = os.path.dirname(var.get()) if var.get() else "/usr/share"
+        path = filedialog.askopenfilename(initialdir=start, title="Choose wordlist",
+                                          filetypes=[("Text files", "*.txt"), ("All files", "*")])
+        if path:
+            var.set(path)
+
+    @staticmethod
+    def best_ffuf_wordlist():
+        return next((p for p in FFUF_WORDLISTS if os.path.isfile(p)), None)
+
+    def _apply_throttle_preset(self, _event=None):
+        preset = THROTTLE_PRESETS.get(self.throttle_preset.get())
+        if preset:
+            threads, rate, jitter = preset
+            self.db_threads.set(threads)
+            self.db_rate.set(rate)
+            self.db_jitter.set(jitter)
+
+    def _throttle_custom(self):
+        self.throttle_preset.set("Custom")
+
+    def _sort_dirbust(self, col, reverse):
+        tree = self.dirbust_tree
+        rows = [(tree.set(k, col), k) for k in tree.get_children("")]
+
+        def key(item):
+            v = item[0]
+            return (0, int(v), "") if v.isdigit() else (1, 0, v.lower())
+        rows.sort(key=key, reverse=reverse)
+        for i, (_, k) in enumerate(rows):
+            tree.move(k, "", i)
+        tree.heading(col, command=lambda: self._sort_dirbust(col, not reverse))
+
+    def _copy_dirbust_url(self, _event):
+        sel = self.dirbust_tree.selection()
+        if sel:
+            url = self.dirbust_tree.set(sel[0], "url")
+            self.master.clipboard_clear()
+            self.master.clipboard_append(url)
+            self.update_status(f"Copied {url}")
+
     def _load_into(self, widget, state_key):
         items = self.state.get(state_key, [])
         if not items:
@@ -395,8 +736,17 @@ class GhostReconGUI:
         self.style.map("TCheckbutton", background=[("active", t["bg"])])
         self.style.configure("TRadiobutton", background=t["bg"], foreground=t["fg"])
         self.style.map("TRadiobutton", background=[("active", t["bg"])])
+        self.style.configure("TSpinbox", fieldbackground=t["text_bg"],
+                             foreground=t["entry_fg"], arrowcolor=t["fg"])
+        self.style.configure("Treeview", background=t["text_bg"], foreground=t["text_fg"],
+                             fieldbackground=t["text_bg"], rowheight=20)
+        self.style.map("Treeview", background=[("selected", t["accent"])],
+                       foreground=[("selected", "#ffffff")])
+        self.style.configure("Treeview.Heading", background=t["tab_bg"], foreground=t["tab_fg"])
+        self.style.map("Treeview.Heading", background=[("active", t["bg"])])
         for widget in list(getattr(self, "outputs", {}).values()) + \
-                [getattr(self, "hosts_input", None), getattr(self, "vuln_input", None)]:
+                [getattr(self, "hosts_input", None), getattr(self, "vuln_input", None),
+                 getattr(self, "dirbust_input", None), getattr(self, "live_feed", None)]:
             if widget is not None:
                 widget.configure(bg=t["text_bg"], fg=t["text_fg"],
                                  insertbackground=t["text_fg"])
@@ -445,6 +795,7 @@ class GhostReconGUI:
     # ------------------------------------------------------------------ #
     def _begin_run(self, output_widget):
         self.running = True
+        self.stop_requested = False
         self.active_output = output_widget
         for b in self.run_buttons:
             b.config(state=tk.DISABLED)
@@ -462,6 +813,7 @@ class GhostReconGUI:
         self.master.after(0, _do)
 
     def stop_scan(self):
+        self.stop_requested = True
         if self.current_proc and self.current_proc.poll() is None:
             try:
                 self.current_proc.terminate()
@@ -498,14 +850,16 @@ class GhostReconGUI:
         self.state["outdir"] = outdir
         return outdir
 
-    def run_stream(self, command, widget, shell=False, outfile=None, merge_stderr=True):
+    def run_stream(self, command, widget, shell=False, outfile=None, merge_stderr=True,
+                   skip_blank=False, on_line=None, echo=True):
         """Run a command, stream output live into `widget`, return list of stdout lines.
 
         merge_stderr=False routes stderr to /dev/null so a tool's progress bars or
         logs (amass writes these to stderr) don't pollute the captured names.
         """
         shown = command if isinstance(command, str) else " ".join(command)
-        self.append(widget, f"$ {shown}\n")
+        if echo:
+            self.append(widget, f"$ {shown}\n")
         lines = []
         try:
             self.current_proc = subprocess.Popen(
@@ -516,6 +870,12 @@ class GhostReconGUI:
             self.append(widget, f"[!] Command not found: {shown}\n")
             return lines
         for line in self.current_proc.stdout:
+            line = strip_ansi(line)
+            if skip_blank and not line.strip():
+                continue   # e.g. ffuf's leading \r becomes an empty line
+            if on_line:    # caller handles display itself (live feed)
+                on_line(line.rstrip("\n"))
+                continue
             lines.append(line.rstrip("\n"))
             self.append(widget, line)
         self.current_proc.wait()
@@ -544,6 +904,8 @@ class GhostReconGUI:
         "naabu": "https://github.com/projectdiscovery/naabu",
         "nmap": "https://nmap.org",
         "nuclei": "https://github.com/projectdiscovery/nuclei",
+        "dirb": "https://dirb.sourceforge.net",
+        "ffuf": "https://github.com/ffuf/ffuf",
     }
 
     # How to install each tool. "go"/"pip" entries run without sudo; "apt" needs sudo.
@@ -561,6 +923,8 @@ class GhostReconGUI:
         "amass":     ("apt", "sudo apt-get install -y amass"),
         "nmap":      ("apt", "sudo apt-get install -y nmap"),
         "curl":      ("apt", "sudo apt-get install -y curl"),
+        "ffuf":      ("go", "go install github.com/ffuf/ffuf/v2@latest"),
+        "dirb":      ("apt", "sudo apt-get install -y dirb"),
     }
 
     def has_tool(self, name):
@@ -746,6 +1110,122 @@ class GhostReconGUI:
         install_btn.config(command=do_install)
 
     # ------------------------------------------------------------------ #
+    # Settings: nuclei engine / template updates
+    # ------------------------------------------------------------------ #
+    NUCLEI_GO_PKG = "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+
+    def _nuclei_install_source(self, path):
+        """How this nuclei binary was installed -> how it must be updated.
+        Distro builds (Kali's apt package) strip nuclei's self-updater (-up),
+        and overwriting an apt-owned binary would fight the package manager."""
+        real = os.path.realpath(path)
+        if real.startswith(os.path.expanduser("~/go/bin")):
+            return "go"
+        try:
+            if subprocess.run(["dpkg", "-S", real], capture_output=True,
+                              timeout=10).returncode == 0:
+                return "apt"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return "self"   # official release binary: has -up
+
+    def update_nuclei_engine(self):
+        path = shutil.which("nuclei")
+        if not path:
+            messagebox.showwarning("nuclei", "nuclei is not installed. Use Settings → "
+                                             "Install missing tools first.")
+            return
+        source = self._nuclei_install_source(path)
+        steps = [("Current version", [path, "-version"])]
+        if source == "apt":
+            if not (shutil.which("pkexec") and os.environ.get("DISPLAY")):
+                messagebox.showinfo(
+                    "nuclei (apt package)",
+                    f"{path} is managed by apt, which needs root. Run in a terminal:\n\n"
+                    "sudo apt update && sudo apt install --only-upgrade nuclei")
+                return
+            # pkexec pops the desktop's graphical password prompt
+            steps.append(("Upgrading apt package (you'll be asked for your password)",
+                          ["pkexec", "sh", "-c",
+                           "apt-get update && apt-get install -y --only-upgrade nuclei"]))
+        elif source == "go":
+            if not self.has_tool("go"):
+                messagebox.showwarning("nuclei", "nuclei was installed with Go, but 'go' "
+                                                 "is not on PATH.")
+                return
+            steps.append(("Rebuilding with go install", ["go", "install", "-v",
+                                                         self.NUCLEI_GO_PKG]))
+        else:
+            steps.append(("Self-updating", [path, "-up"]))
+        steps.append(("New version", [path, "-version"]))
+        self._run_steps_dialog(f"Update nuclei engine ({source} install)", steps)
+
+    def update_nuclei_templates(self):
+        path = shutil.which("nuclei")
+        if not path:
+            messagebox.showwarning("nuclei", "nuclei is not installed. Use Settings → "
+                                             "Install missing tools first.")
+            return
+        # Templates live in the user's home -- no root needed, any install type.
+        self._run_steps_dialog("Update nuclei templates", [
+            ("Installed templates", [path, "-tv"]),
+            ("Downloading latest templates", [path, "-ut"]),
+            ("Templates now", [path, "-tv"]),
+        ])
+
+    def _run_steps_dialog(self, title, steps):
+        """Run commands one after another in a log window, streaming output."""
+        win = tk.Toplevel(self.master)
+        win.title(title)
+        win.geometry("760x420")
+        t = THEMES[self.theme_name]
+        win.configure(bg=t["bg"])
+        ttk.Label(win, text=title, font=("Helvetica", 13, "bold")
+                  ).pack(anchor="w", padx=12, pady=(12, 4))
+        out = tk.Text(win, wrap=tk.WORD, state="disabled", font=("Courier New", 9),
+                      bg=t["text_bg"], fg=t["text_fg"], relief=tk.FLAT)
+        out.pack(fill="both", expand=True, padx=12, pady=6)
+        close = ttk.Button(win, text="Close", command=win.destroy, state=tk.DISABLED)
+        close.pack(anchor="e", padx=12, pady=(0, 12))
+
+        def append(text):
+            def _do():
+                if out.winfo_exists():
+                    out.config(state="normal")
+                    out.insert(tk.END, text)
+                    out.see(tk.END)
+                    out.config(state="disabled")
+            win.after(0, _do)
+
+        def worker():
+            ok = True
+            for label, cmd in steps:
+                append(f"\n=== {label} ===\n$ {' '.join(cmd)}\n")
+                try:
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                    for line in proc.stdout:
+                        append(strip_ansi(line))
+                    proc.wait()
+                except OSError as e:
+                    append(f"[!] {e}\n")
+                    ok = False
+                    break
+                if proc.returncode != 0:
+                    # pkexec: 126 = password dialog dismissed, 127 = not authorized
+                    hint = " (authentication cancelled or denied)" \
+                        if cmd[0] == "pkexec" and proc.returncode in (126, 127) else ""
+                    append(f"[!] Exited with code {proc.returncode}{hint}\n")
+                    if label not in ("Current version", "Installed templates"):
+                        ok = False
+                        break
+            append(f"\n{'[+] Done.' if ok else '[!] Update did not complete.'}\n")
+            self.update_status(f"{title}: {'done' if ok else 'failed'}")
+            win.after(0, lambda: close.config(state=tk.NORMAL) if close.winfo_exists() else None)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
     # Stage 1: Subdomains
     # ------------------------------------------------------------------ #
     def start_subdomain_recon(self):
@@ -889,6 +1369,8 @@ class GhostReconGUI:
         bare = sorted({re.sub(r'^https?://', '', ln.split(" ")[0]).split("/")[0]
                        for ln in live})
         self.state["live_hosts"] = bare
+        self.state["live_urls"] = sorted({ln.split(" ")[0] for ln in live
+                                          if ln.startswith("http")})
         self.append(w, f"\n[+] {len(bare)} live hosts saved to {out}\n")
         self.update_status(f"httpx done. {len(bare)} live hosts.")
 
@@ -1005,6 +1487,278 @@ class GhostReconGUI:
         self.append(w, f"\n[+] Saved to {out}\n")
         self.update_status(f"nuclei done -> {out}")
 
+
+    # ------------------------------------------------------------------ #
+    # Stage 6: Directory busting (dirb + ffuf, merged results)
+    # ------------------------------------------------------------------ #
+    def start_dirbust(self):
+        lines = [ln.strip() for ln in self.dirbust_input.get("1.0", tk.END).splitlines()
+                 if ln.strip()]
+        targets = []
+        for ln in lines:
+            url = ln if re.match(r'^https?://', ln, re.I) else f"https://{ln}"
+            host = re.sub(r'^https?://', '', url, flags=re.I).split("/")[0].split(":")[0]
+            if is_url(url) and is_host(host):
+                targets.append(url.rstrip("/"))
+        if not targets:
+            messagebox.showwarning("Input", "Enter at least one valid URL or host.")
+            return
+        use_dirb, use_ffuf = self.db_use_dirb.get(), self.db_use_ffuf.get()
+        if not (use_dirb or use_ffuf):
+            messagebox.showwarning("Input", "Select dirb, ffuf, or both.")
+            return
+
+        cfg = {"dirb": use_dirb, "ffuf": use_ffuf,
+               "dirb_wl": self.dirb_wordlist.get().strip(),
+               "ffuf_wl": self.ffuf_wordlist.get().strip()}
+        for tool in ("dirb", "ffuf"):
+            if cfg[tool] and not os.path.isfile(cfg[f"{tool}_wl"]):
+                messagebox.showwarning("Wordlist", f"{tool} wordlist not found:\n{cfg[f'{tool}_wl']}")
+                return
+        try:
+            cfg["threads"] = max(1, int(self.db_threads.get()))
+            cfg["rate"] = max(0, int(self.db_rate.get()))
+        except (tk.TclError, ValueError):
+            messagebox.showwarning("Throttle", "Threads and req/s must be whole numbers.")
+            return
+        cfg["jitter"] = self.db_jitter.get()
+        cfg["ua"] = BROWSER_UA if self.db_browser_ua.get() else None
+        cfg["recursive"] = self.db_recursive.get()
+
+        # ffuf runs with -mc all so every response reaches the live feed;
+        # GhostRecon applies these matchers/filters itself to decide hits.
+        fspec = {"mc": parse_ranges(FFUF_DEFAULT_MC), "fc": [], "fs": [], "fw": [],
+                 "fl": [], "fr": None, "ac": False}
+        for flag, (on, val) in self.ffuf_filters.items():
+            if not on.get():
+                continue
+            key = flag.lstrip("-")
+            if val is None:
+                fspec[key] = True
+                continue
+            v = val.get().strip()
+            if not v:
+                messagebox.showwarning("ffuf filters", f"{flag} is checked but has no value.")
+                return
+            if flag == "-fr":
+                try:
+                    re.compile(v)
+                except re.error as e:
+                    messagebox.showwarning("ffuf filters", f"Invalid regex for -fr: {e}")
+                    return
+                fspec["fr"] = v
+            elif flag == "-mc" and v.lower() == "all":
+                fspec["mc"] = "all"
+            elif FFUF_NUM_RE.match(v):
+                try:
+                    fspec[key] = parse_ranges(v)
+                except ValueError:
+                    messagebox.showwarning("ffuf filters", f"Bad value for {flag}: {v}")
+                    return
+            else:
+                messagebox.showwarning("ffuf filters",
+                                       f"{flag} expects numbers/ranges like 404 or 100-200,4242.")
+                return
+        cfg["fspec"] = fspec
+
+        self.dirbust_tree.delete(*self.dirbust_tree.get_children())
+        self._launch(self.run_dirbust, self.outputs["dir"], (targets, cfg))
+
+    def run_dirbust(self, targets, cfg):
+        w = self.outputs["dir"]
+        tools = [t for t in ("dirb", "ffuf") if cfg[t] and self.require(w, t)]
+        if not tools:
+            return
+        first_host = re.sub(r'^https?://', '', targets[0], flags=re.I).split("/")[0]
+        outdir = self.state["outdir"] or self._new_outdir(first_host)
+        rate, threads = cfg["rate"], cfg["threads"]
+        self.append(w, f"[*] Throttle: {threads} thread(s), "
+                       f"{'unlimited' if not rate else f'max {rate} req/s'}"
+                       f"{', jitter on' if cfg['jitter'] else ''}\n")
+
+        fspec = cfg["fspec"]
+        merged = {}   # normalized url -> {url, status, size, sources}
+
+        def add(url, status, size, source):
+            key = url.rstrip("/").lower()
+            entry = merged.setdefault(key, {"url": url.rstrip("/") or url, "status": "",
+                                            "size": "", "sources": set()})
+            entry["sources"].add(source)
+            # Prefer a real status/size over dirb's bare "DIR" marker.
+            if status and (not entry["status"] or entry["status"] == "DIR"):
+                entry["status"] = str(status)
+            if size != "" and entry["size"] == "":
+                entry["size"] = str(size)
+
+        for i, base in enumerate(targets, 1):
+            if self.stop_requested:
+                self.append(w, "\n[!] Stopped — skipping remaining targets.\n")
+                break
+            tag = sanitize_for_path(re.sub(r'^https?://', '', base, flags=re.I))
+            self.append(w, f"\n=== [{i}/{len(targets)}] {base} ===\n")
+
+            if "dirb" in tools and not self.stop_requested:
+                self.update_status(f"dirb -> {base} ({i}/{len(targets)})")
+                out = os.path.join(outdir, f"dirb_{tag}.txt")
+                # -v prints every word (404s too) so the live feed sees each test
+                cmd = ["dirb", base + "/", cfg["dirb_wl"], "-S", "-v", "-o", out]
+                if not cfg["recursive"]:
+                    cmd.append("-r")
+                if rate:   # dirb is single-threaded, so a fixed delay == a rate cap
+                    cmd += ["-z", str(max(1, 1000 // rate))]
+                if cfg["ua"]:
+                    cmd += ["-a", cfg["ua"]]
+                self._feed_begin("dirb", base, self._count_words(cfg["dirb_wl"]))
+                # dirb block-buffers stdout into a pipe; force line buffering
+                if shutil.which("stdbuf"):
+                    cmd = ["stdbuf", "-oL"] + cmd
+                self.run_stream(cmd, w, on_line=lambda ln, b=base: self._dirb_line(ln, b, w, add))
+                self._feed["done"] = True
+
+            if "ffuf" in tools and not self.stop_requested:
+                self.update_status(f"ffuf -> {base} ({i}/{len(targets)})")
+                common = ["-noninteractive", "-json", "-mc", "all", "-t", str(threads)]
+                if rate:
+                    common += ["-rate", str(rate)]
+                if cfg["jitter"]:
+                    common += ["-p", "0.1-1.0"]
+                if cfg["ua"]:
+                    common += ["-H", f"User-Agent: {cfg['ua']}"]
+                if fspec["fr"]:   # needs the body, so ffuf applies it natively
+                    common += ["-fr", fspec["fr"]]
+                calib = self._ffuf_calibrate(base, common, w) if fspec["ac"] else {}
+                if self.stop_requested:
+                    continue
+                cmd = ["ffuf", "-u", base + "/FUZZ", "-w", cfg["ffuf_wl"], "-ic"] + common
+                if cfg["recursive"]:
+                    cmd += ["-recursion", "-recursion-depth", "2"]
+                hits = []
+                self._feed_begin("ffuf", base, self._count_words(cfg["ffuf_wl"]))
+                # stderr = banner + progress bar; stdout = one JSON line per response
+                self.run_stream(cmd, w, merge_stderr=False, on_line=lambda ln, b=base:
+                                self._ffuf_line(ln, b, w, add, fspec, calib, hits))
+                self._feed["done"] = True
+                if hits:
+                    with open(os.path.join(outdir, f"ffuf_{tag}.txt"), "w") as fh:
+                        fh.write("\n".join(hits) + "\n")
+
+        rows = sorted(merged.values(), key=lambda e: e["url"].lower())
+        combined = os.path.join(outdir, "dirbust_combined.txt")
+        with open(combined, "w") as f:
+            f.write("url\tstatus\tsize\tfound_by\n")
+            for e in rows:
+                f.write(f"{e['url']}\t{e['status']}\t{e['size']}\t"
+                        f"{','.join(sorted(e['sources']))}\n")
+        self.state["dirs"] = [e["url"] for e in rows]
+        both = sum(1 for e in rows if len(e["sources"]) > 1)
+
+        def fill():
+            for e in rows:
+                src = sorted(e["sources"])
+                self.dirbust_tree.insert("", tk.END, values=(
+                    e["url"], e["status"], e["size"],
+                    "both" if len(src) > 1 else src[0]))
+            self.dirbust_summary.config(
+                text=f"Combined results: {len(rows)} unique paths "
+                     f"({both} found by both) — double-click a row to copy its URL")
+        self.master.after(0, fill)
+        self.append(w, f"\n[+] {len(rows)} unique paths ({both} found by both) -> {combined}\n")
+        self.update_status(f"Dir busting done. {len(rows)} paths -> {combined}")
+
+    DIRB_HIT_RE = re.compile(r'^\+ (\S+) \(CODE:(\d+)\|SIZE:(\d+)\)')
+    DIRB_DIR_RE = re.compile(r'^==> DIRECTORY: (\S+)')
+
+    @staticmethod
+    def _rel(url, base):
+        return (url[len(base):] or "/") if url.startswith(base) else url
+
+    def _dirb_line(self, line, base, w, add):
+        ln = line.strip()
+        m = self.DIRB_HIT_RE.match(ln)
+        if m:   # with -v dirb reports every word; 404 = not found
+            url, code, size = m.groups()
+            hit = code != "404"
+            self._feed_push(self._rel(url, base), code, size, hit)
+            if hit:
+                add(url, code, size, "dirb")
+                self.append(w, f"[dirb] {url}  [{code}]  {size} B\n")
+            return
+        m = self.DIRB_DIR_RE.match(ln)
+        if m:
+            add(m.group(1), "DIR", "", "dirb")
+            self.append(w, f"[dirb] {m.group(1)}  [DIRECTORY]\n")
+        elif ln.startswith("(!)"):   # dirb warnings/errors
+            self.append(w, f"[dirb] {ln}\n")
+
+    def _ffuf_line(self, line, base, w, add, fspec, calib, hits):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            if line.strip():
+                self.append(w, f"[ffuf] {line.strip()}\n")
+            return
+        url, code, size = r.get("url", ""), r.get("status", 0), r.get("length", 0)
+        hit = self._ffuf_is_hit(r, fspec, calib)
+        self._feed_push(self._rel(url, base), code, size, hit)
+        if hit:
+            add(url, code, size, "ffuf")
+            hits.append(f"{url}\t{code}\t{size}")
+            self.append(w, f"[ffuf] {url}  [{code}]  {size} B  "
+                           f"(words {r.get('words')}, lines {r.get('lines')})\n")
+
+    @staticmethod
+    def _ffuf_is_hit(r, fspec, calib):
+        code, size = r.get("status", 0), r.get("length", 0)
+        words, lines = r.get("words", 0), r.get("lines", 0)
+        if fspec["mc"] != "all" and not in_ranges(code, fspec["mc"]):
+            return False
+        if (in_ranges(code, fspec["fc"]) or in_ranges(size, fspec["fs"])
+                or in_ranges(words, fspec["fw"]) or in_ranges(lines, fspec["fl"])):
+            return False
+        rule = calib.get(code)   # auto-calibration: (field, value) per status
+        if rule and r.get(rule[0]) == rule[1]:
+            return False
+        return True
+
+    def _ffuf_calibrate(self, base, common, w):
+        """Our own -ac: request a few paths that can't exist and learn what the
+        server's "not found" looks like per status code (size, else words,
+        else lines). ffuf's built-in -ac can't be used because it would also
+        hide those responses from the live feed."""
+        rnd = lambda n: "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+        probes = [rnd(8), rnd(16), rnd(32), "admin" + rnd(8), ".htaccess" + rnd(8), rnd(10) + "/"]
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        tmp.write("\n".join(probes) + "\n")
+        tmp.close()
+        self.append(w, f"[*] Auto-calibrating against {base} ({len(probes)} probe requests) ...\n")
+        recs = []
+
+        def grab(ln):
+            try:
+                recs.append(json.loads(ln))
+            except ValueError:
+                pass
+        try:
+            self.run_stream(["ffuf", "-u", base + "/FUZZ", "-w", tmp.name] + common,
+                            w, on_line=grab, echo=False, merge_stderr=False)
+        finally:
+            os.unlink(tmp.name)
+        by_code = {}
+        for r in recs:
+            by_code.setdefault(r.get("status"), []).append(r)
+        calib = {}
+        for code, rs in by_code.items():
+            for field in ("length", "words", "lines"):
+                vals = {r.get(field) for r in rs}
+                if len(vals) == 1:
+                    calib[code] = (field, vals.pop())
+                    break
+        if calib:
+            desc = ", ".join(f"{c} with {f}={v}" for c, (f, v) in sorted(calib.items()))
+            self.append(w, f"[*] Calibration: treating {desc} as not-found\n")
+        else:
+            self.append(w, "[!] Calibration found no stable not-found signature.\n")
+        return calib
 
 if __name__ == "__main__":
     root = tk.Tk()

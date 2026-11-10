@@ -9,8 +9,9 @@ A GUI reconnaissance toolkit by [@TitoSantana00](https://github.com/TitoSantana6
 ```
 1. Subdomains ──> 2. Live Hosts ──┬──> 4. Ports (naabu / nmap)
    (amass, subfinder,  (httpx:       ├──> 5. Vulnerabilities (nuclei)
-    subfaster,          alive +      └──> 3. URLs (gau + waybackurls + katana)
-    crt.sh / crt.name)  title + tech)        └──> gf patterns ──> uro
+    subfaster,          alive +      ├──> 6. Dir Busting (dirb + ffuf, merged results)
+    crt.sh / crt.name)  title + tech)└──> 3. URLs (gau + waybackurls + katana)
+                                             └──> gf patterns ──> uro
 ```
 
 Each stage can load its input from the previous one, so a full sweep flows from a single domain down to filtered vulnerability candidates.
@@ -23,10 +24,15 @@ Each stage can load its input from the previous one, so a full sweep flows from 
 - **URL discovery** from `gau`, `waybackurls`, and `katana`, merged and deduped, then filtered through a chosen **`gf` pattern** (xss, ssrf, lfi, sqli, redirect, rce, idor, ssti) and cleaned with `uro`.
 - **Port scanning** via `naabu` (fast) or `nmap` (`-sV`).
 - **Vulnerability scanning** with `nuclei` and a severity selector.
+- **Directory busting** with `dirb` (its standard `common.txt`) and `ffuf` (auto-picks SecLists `raft-medium-directories.txt`, falling back to DirBuster medium, then dirb's list; both overridable). Findings from both tools are merged and de-duplicated into one sortable results table showing status, size and which tool found each path (`dirb`, `ffuf` or `both`), saved to `dirbust_combined.txt`.
+  - **ffuf filter checkboxes:** auto-calibrate, match codes (`-mc`), filter codes/size/words/lines/regex (`-fc`/`-fs`/`-fw`/`-fl`/`-fr`).
+  - **Live request feed:** every word tested scrolls by with its response code and size (color-coded, hits in bold), under a status line showing tested/total, %, req/s, hit count and elapsed time — so you can tell a slow, throttled scan from a stalled one.
+  - **Throttling** so you don't overload the server or trip a WAF: presets (Aggressive / Normal / Polite / Stealth) or custom threads + max requests/sec, random delay jitter, and a browser User-Agent. The rate cap applies to dirb too (converted to its `-z` delay).
 - **Live streaming log + progress bar + Stop button** — no frozen window on long scans.
 - **Organized output** — every run is saved to `results/<target>/<timestamp>/<tool>.txt`.
 - **Dark / light theme** toggle (View menu).
 - **Settings → Install missing tools** — detects which required tools are missing and installs the Go/pip-based ones for you (each via its own pinned install command).
+- **Settings → Update nuclei engine / templates** — templates (`nuclei -ut`) need no root. The engine update follows how nuclei was installed: Kali's apt package via `pkexec apt` (graphical password prompt, since distro builds lack `-up`), Go installs via `go install …@latest`, and release binaries via `nuclei -up`.
 
 ## Requirements
 
@@ -48,6 +54,9 @@ Each stage can load its input from the previous one, so a full sweep flows from 
 | naabu | `go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest` |
 | nmap | `sudo apt install nmap` |
 | nuclei | `go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+| dirb | `sudo apt install dirb` |
+| ffuf | `go install github.com/ffuf/ffuf/v2@latest` |
+| SecLists (wordlists) | `sudo apt install seclists` |
 
 > **httpx note:** the name `httpx` collides with the Python HTTP-client CLI (`python3-httpx`), which ships on some distros (e.g. Kali) at `/usr/bin/httpx`. GhostRecon detects ProjectDiscovery's httpx specifically and prefers `~/go/bin/httpx`, so both can coexist — just make sure the real one is installed.
 
