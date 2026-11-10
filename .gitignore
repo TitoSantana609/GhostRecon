@@ -12,3 +12,21 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Secrets / credentials -- never commit these
+githubPAT*
+*.pat
+*.token
+token.txt
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.git-credentials
+.netrc
+credentials*
+secrets*
