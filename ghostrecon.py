@@ -120,6 +120,41 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 # --------------------------------------------------------------------------- #
+# Global request options (proxy / headers / rate) -- how each tool spells them.
+# Tools absent from a table simply don't get that option injected.
+# --------------------------------------------------------------------------- #
+# Proxy flag per tool (value is the proxy URL).
+PROXY_FLAG = {
+    "httpx": "-http-proxy", "katana": "-proxy", "nuclei": "-proxy",
+    "dnsx": "-proxy", "naabu": "-proxy", "ffuf": "-x",
+    "wpscan": "--proxy", "nikto": "-useproxy",
+}
+# Requests/sec cap per tool (0/unset = no cap). ffuf/dirb carry their own in the
+# Dir Busting tab, so they're injected there, not globally.
+RATE_FLAG = {
+    "httpx": "-rate-limit", "nuclei": "-rate-limit",
+    "katana": "-rate-limit", "naabu": "-rate",
+}
+# How a tool accepts custom headers:
+#   "-H"/"-Add-header" -> repeat the flag once per "Name: Value"
+#   "join"             -> one flag, headers joined by "; " (wpscan)
+#   "nl"               -> one flag, headers joined by newlines (arjun)
+HEADER_STYLE = {
+    "httpx": ("-H", "repeat"), "katana": ("-H", "repeat"),
+    "nuclei": ("-H", "repeat"), "ffuf": ("-H", "repeat"),
+    "dirb": ("-H", "repeat"), "nikto": ("-Add-header", "repeat"),
+    "wpscan": ("--headers", "join"), "arjun": ("--headers", "nl"),
+}
+DEFAULT_SETTINGS = {
+    "proxy_on": False, "proxy_url": "http://127.0.0.1:8080",
+    "headers": [], "cookie": "",
+    "bb_on": False, "bb_header": "X-Bug-Bounty", "bb_value": "",
+    "rate": 0,            # global requests/sec cap (0 = unlimited)
+    "browser_ua": False,  # send a real-browser User-Agent everywhere
+}
+
+
+# --------------------------------------------------------------------------- #
 # Themes
 # --------------------------------------------------------------------------- #
 THEMES = {
@@ -160,6 +195,11 @@ class GhostReconGUI:
             "urls": [],
             "dirs": [],                # merged dirb + ffuf findings
         }
+
+        # Global request options (Burp proxy, headers, cookie, rate) shared by
+        # every tool. Loaded from disk so they persist across runs.
+        self.gopts = dict(DEFAULT_SETTINGS)
+        self._load_settings()
 
         # Make sure go/pip user bin dirs are visible so freshly-installed tools resolve
         for p in ("~/go/bin", "~/.local/bin"):
@@ -204,6 +244,191 @@ class GhostReconGUI:
     # ------------------------------------------------------------------ #
     # Menu
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Global request options: persistence + command augmentation
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _settings_path():
+        d = os.path.expanduser("~/.config/ghostrecon")
+        return os.path.join(d, "settings.json")
+
+    def _load_settings(self):
+        try:
+            with open(self._settings_path()) as f:
+                saved = json.load(f)
+            for k in DEFAULT_SETTINGS:
+                if k in saved:
+                    self.gopts[k] = saved[k]
+        except (OSError, ValueError):
+            pass   # no/with bad settings file -> keep defaults
+
+    def _save_settings(self):
+        path = self._settings_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(self.gopts, f, indent=2)
+            os.chmod(path, 0o600)   # may hold a session cookie -> keep it private
+        except OSError as e:
+            messagebox.showwarning("Settings", f"Could not save settings:\n{e}")
+
+    def _all_headers(self):
+        """Every header to send: user headers + Cookie + X-Bug-Bounty + UA."""
+        headers = []
+        for h in self.gopts["headers"]:
+            if ":" in h:
+                headers.append(h.strip())
+        if self.gopts["cookie"].strip():
+            headers.append(f"Cookie: {self.gopts['cookie'].strip()}")
+        if self.gopts["bb_on"] and self.gopts["bb_value"].strip():
+            headers.append(f"{self.gopts['bb_header'].strip()}: "
+                           f"{self.gopts['bb_value'].strip()}")
+        if self.gopts["browser_ua"]:
+            headers.append(f"User-Agent: {BROWSER_UA}")
+        return headers
+
+    def _proxy_url(self):
+        return self.gopts["proxy_url"].strip() if self.gopts["proxy_on"] else None
+
+    def augment(self, cmd, tool):
+        """Return cmd (a list) with the global proxy, headers and rate cap added
+        in `tool`'s own flag syntax. Unknown options for a tool are skipped."""
+        if not isinstance(cmd, list):
+            return cmd   # shell-string commands are augmented by their builders
+        cmd = list(cmd)
+        proxy = self._proxy_url()
+        if proxy and tool in PROXY_FLAG:
+            cmd += [PROXY_FLAG[tool], proxy]
+        rate = self.gopts["rate"]
+        if rate and tool in RATE_FLAG:
+            cmd += [RATE_FLAG[tool], str(rate)]
+        headers = self._all_headers()
+        if headers and tool in HEADER_STYLE:
+            flag, style = HEADER_STYLE[tool]
+            if style == "repeat":
+                for h in headers:
+                    cmd += [flag, h]
+            elif style == "join":
+                cmd += [flag, "; ".join(headers)]
+            elif style == "nl":
+                cmd += [flag, "\n".join(headers)]
+        return cmd
+
+    def proxy_summary(self):
+        p = self._proxy_url()
+        bits = []
+        if p:
+            bits.append(f"proxy {p}")
+        if self._all_headers():
+            bits.append(f"{len(self._all_headers())} header(s)")
+        if self.gopts["rate"]:
+            bits.append(f"{self.gopts['rate']} req/s")
+        return " · ".join(bits) if bits else "no global options set"
+
+    def open_global_settings(self):
+        win = tk.Toplevel(self.master)
+        win.title("Global request settings")
+        win.geometry("640x620")
+        t = THEMES[self.theme_name]
+        win.configure(bg=t["bg"])
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+        g = self.gopts
+        row = 0
+
+        def section(title):
+            nonlocal row
+            ttk.Label(frm, text=title, font=("Helvetica", 11, "bold")
+                      ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
+            row += 1
+
+        section("Burp / upstream proxy")
+        proxy_on = tk.BooleanVar(value=g["proxy_on"])
+        ttk.Checkbutton(frm, text="Route tool traffic through a proxy",
+                        variable=proxy_on).grid(row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+        ttk.Label(frm, text="Proxy URL:").grid(row=row, column=0, sticky="w")
+        proxy_url = tk.StringVar(value=g["proxy_url"])
+        ttk.Entry(frm, textvariable=proxy_url).grid(row=row, column=1, columnspan=2,
+                                                    sticky="ew", padx=4)
+        row += 1
+        ttk.Label(frm, text="Burp default is http://127.0.0.1:8080. Applies to httpx, "
+                            "katana, nuclei,\nffuf, naabu, dnsx, wpscan, nikto.",
+                  foreground=t["tab_fg"]).grid(row=row, column=0, columnspan=3,
+                                               sticky="w", pady=(0, 4))
+        row += 1
+
+        section("Custom headers (one per line, \"Name: Value\")")
+        headers_txt = tk.Text(frm, height=5, wrap=tk.NONE, font=("Courier New", 10),
+                              bg=t["text_bg"], fg=t["text_fg"], insertbackground=t["text_fg"])
+        headers_txt.grid(row=row, column=0, columnspan=3, sticky="ew")
+        headers_txt.insert("1.0", "\n".join(g["headers"]))
+        row += 1
+        ttk.Label(frm, text="Cookie:").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        cookie = tk.StringVar(value=g["cookie"])
+        ttk.Entry(frm, textvariable=cookie).grid(row=row, column=1, columnspan=2,
+                                                 sticky="ew", padx=4, pady=(4, 0))
+        row += 1
+
+        section("Bug-bounty identification header")
+        bb_on = tk.BooleanVar(value=g["bb_on"])
+        ttk.Checkbutton(frm, text="Send an identifying header (many programs require it)",
+                        variable=bb_on).grid(row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+        bbframe = ttk.Frame(frm)
+        bbframe.grid(row=row, column=0, columnspan=3, sticky="ew")
+        ttk.Label(bbframe, text="Header:").pack(side="left")
+        bb_header = tk.StringVar(value=g["bb_header"])
+        ttk.Entry(bbframe, textvariable=bb_header, width=18).pack(side="left", padx=4)
+        ttk.Label(bbframe, text="Value (e.g. your H1/username):").pack(side="left")
+        bb_value = tk.StringVar(value=g["bb_value"])
+        ttk.Entry(bbframe, textvariable=bb_value).pack(side="left", fill="x",
+                                                       expand=True, padx=4)
+        row += 1
+
+        section("Throttle / fingerprint")
+        uaframe = ttk.Frame(frm)
+        uaframe.grid(row=row, column=0, columnspan=3, sticky="ew")
+        browser_ua = tk.BooleanVar(value=g["browser_ua"])
+        ttk.Checkbutton(uaframe, text="Send a real-browser User-Agent",
+                        variable=browser_ua).pack(side="left")
+        ttk.Label(uaframe, text="   Global max req/s (0 = unlimited):").pack(side="left")
+        rate = tk.IntVar(value=g["rate"])
+        ttk.Spinbox(uaframe, from_=0, to=1000, width=6, textvariable=rate
+                    ).pack(side="left", padx=4)
+        row += 1
+        ttk.Label(frm, text="Rate cap applies to httpx, nuclei, katana, naabu. Dir Busting\n"
+                            "keeps its own per-scan throttle.", foreground=t["tab_fg"]
+                  ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=0, columnspan=3, sticky="e", pady=(8, 0))
+
+        def save():
+            rate_val = rate.get() if str(rate.get()).isdigit() else 0
+            px = proxy_url.get().strip()
+            if proxy_on.get() and not re.match(r'^(https?|socks5h?)://', px, re.I):
+                messagebox.showwarning("Proxy", "Proxy URL must start with http://, "
+                                               "https:// or socks5://.", parent=win)
+                return
+            self.gopts.update({
+                "proxy_on": proxy_on.get(), "proxy_url": px or DEFAULT_SETTINGS["proxy_url"],
+                "headers": [ln.strip() for ln in
+                            headers_txt.get("1.0", tk.END).splitlines() if ln.strip()],
+                "cookie": cookie.get().strip(),
+                "bb_on": bb_on.get(), "bb_header": bb_header.get().strip() or "X-Bug-Bounty",
+                "bb_value": bb_value.get().strip(),
+                "rate": max(0, rate_val), "browser_ua": browser_ua.get(),
+            })
+            self._save_settings()
+            self.update_status(f"Global settings saved — {self.proxy_summary()}")
+            win.destroy()
+
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+        ttk.Button(btns, text="Save", command=save).pack(side="right")
+
     def _build_menu(self):
         menubar = tk.Menu(self.master)
         view = tk.Menu(menubar, tearoff=0)
@@ -215,6 +440,9 @@ class GhostReconGUI:
         menubar.add_cascade(label="Tools", menu=tools)
 
         settings = tk.Menu(menubar, tearoff=0)
+        settings.add_command(label="Global request settings (proxy / headers)…",
+                             command=self.open_global_settings)
+        settings.add_separator()
         settings.add_command(label="Install missing tools…",
                              command=self.open_install_dialog)
         settings.add_separator()
@@ -1362,8 +1590,8 @@ class GhostReconGUI:
             f.write("\n".join(hosts) + "\n")
         out = os.path.join(outdir, "live_hosts.txt")
         self.update_status(f"Probing {len(hosts)} hosts with httpx ...")
-        self.run_stream([httpx_bin, "-l", infile, "-silent", "-status-code",
-                         "-title", "-tech-detect", "-o", out], w)
+        self.run_stream(self.augment([httpx_bin, "-l", infile, "-silent", "-status-code",
+                         "-title", "-tech-detect", "-o", out], "httpx"), w)
         live = sorted(self._read_lines(out))
         # store bare hosts (strip http scheme + metadata) for downstream stages
         bare = sorted({re.sub(r'^https?://', '', ln.split(" ")[0]).split("/")[0]
@@ -1406,7 +1634,8 @@ class GhostReconGUI:
             self.update_status("Running katana ...")
             out = os.path.join(outdir, "katana.txt")
             url = target if target.startswith("http") else f"https://{bare}"
-            self.run_stream(["katana", "-u", url, "-silent", "-jc"], w, outfile=out)
+            self.run_stream(self.augment(["katana", "-u", url, "-silent", "-jc"],
+                                         "katana"), w, outfile=out)
             all_urls |= self._read_lines(out)
 
         combined = os.path.join(outdir, "all_urls.txt")
@@ -1452,7 +1681,8 @@ class GhostReconGUI:
         out = os.path.join(outdir, f"ports_{scanner}_{sanitize_for_path(host)}.txt")
         self.update_status(f"Port scanning {host} with {scanner} ...")
         if scanner == "naabu":
-            self.run_stream(["naabu", "-host", host, "-silent", "-o", out], w)
+            self.run_stream(self.augment(["naabu", "-host", host, "-silent", "-o", out],
+                                         "naabu"), w)
         else:
             self.run_stream(["nmap", "-sV", "-T4", "-oN", out, host], w)
         self.append(w, f"\n[+] Saved to {out}\n")
@@ -1483,7 +1713,7 @@ class GhostReconGUI:
         if sev:
             cmd += ["-severity", sev]
         self.update_status(f"Running nuclei on {len(targets)} targets ...")
-        self.run_stream(cmd, w)
+        self.run_stream(self.augment(cmd, "nuclei"), w)
         self.append(w, f"\n[+] Saved to {out}\n")
         self.update_status(f"nuclei done -> {out}")
 
@@ -1626,6 +1856,12 @@ class GhostReconGUI:
                     common += ["-H", f"User-Agent: {cfg['ua']}"]
                 if fspec["fr"]:   # needs the body, so ffuf applies it natively
                     common += ["-fr", fspec["fr"]]
+                # Global Burp proxy + custom headers (the tab owns rate + UA).
+                if self._proxy_url():
+                    common += ["-x", self._proxy_url()]
+                for h in self._all_headers():
+                    if not (cfg["ua"] and h.lower().startswith("user-agent:")):
+                        common += ["-H", h]
                 calib = self._ffuf_calibrate(base, common, w) if fspec["ac"] else {}
                 if self.stop_requested:
                     continue
