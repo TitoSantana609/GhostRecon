@@ -2123,7 +2123,8 @@ class GhostReconGUI:
     # ------------------------------------------------------------------ #
     def start_httpx(self):
         hosts = [h.strip() for h in self.hosts_input.get("1.0", tk.END).splitlines() if h.strip()]
-        hosts = [h for h in hosts if is_host(h)]
+        hosts = [h for h in hosts
+                 if is_host(re.sub(r'^https?://', '', h).split("/")[0].split(":")[0])]
         hosts = self.scope_filter(hosts, self.outputs["live"])
         if not hosts:
             messagebox.showwarning("Input", "No valid in-scope hosts to probe.")
@@ -2169,7 +2170,7 @@ class GhostReconGUI:
     # ------------------------------------------------------------------ #
     def start_url_recon(self):
         target = self.url_entry.get().strip().lower()
-        bare = re.sub(r'^https?://', '', target).split("/")[0]
+        bare = re.sub(r'^https?://', '', target).split("/")[0].split(":")[0]
         if not (is_url(target) and is_host(bare)):
             messagebox.showwarning("Input", "Enter a valid domain or URL.")
             return
@@ -2220,7 +2221,7 @@ class GhostReconGUI:
                 cmd = f"cat {combined} | gf {pattern} | uro | tee {out}"
                 self.append(w, f"\n--- gf {pattern} results ---\n")
                 self.run_stream(cmd, w, shell=True)
-                if os.path.getsize(out) == 0:
+                if not os.path.exists(out) or os.path.getsize(out) == 0:
                     self.append(w, f"\n[*] 0 matches for '{pattern}' in this URL set (file saved, but empty).\n")
                 else:
                     self.append(w, f"\n[+] Saved to {out}\n")
@@ -2231,7 +2232,8 @@ class GhostReconGUI:
     # ------------------------------------------------------------------ #
     def start_port_scan(self):
         host = self.port_entry.get().strip().lower()
-        host = re.sub(r'^https?://', '', host).split("/")[0]
+        # a port scanner wants the bare host; strip any scheme/path/port
+        host = re.sub(r'^https?://', '', host).split("/")[0].split(":")[0]
         if not is_host(host):
             messagebox.showwarning("Input", "Enter a valid host or IP.")
             return
@@ -2261,7 +2263,8 @@ class GhostReconGUI:
     # ------------------------------------------------------------------ #
     def start_nuclei(self):
         targets = [t.strip() for t in self.vuln_input.get("1.0", tk.END).splitlines() if t.strip()]
-        targets = [t for t in targets if is_host(re.sub(r'^https?://', '', t).split("/")[0])]
+        targets = [t for t in targets
+                   if is_host(re.sub(r'^https?://', '', t).split("/")[0].split(":")[0])]
         targets = self.scope_filter(targets, self.outputs["vuln"])
         if not targets:
             messagebox.showwarning("Input", "No valid in-scope targets.")
@@ -3041,7 +3044,7 @@ class GhostReconGUI:
     # ---- Takeover ---- #
     def start_takeover(self):
         hosts = [h for h in self._lines_from(self.takeover_input)
-                 if is_host(re.sub(r'^https?://', '', h).split("/")[0])]
+                 if is_host(re.sub(r'^https?://', '', h).split("/")[0].split(":")[0])]
         hosts = self.scope_filter(hosts, self.outputs["takeover"])
         if not hosts:
             messagebox.showwarning("Input", "No valid in-scope hosts.")
@@ -3050,7 +3053,8 @@ class GhostReconGUI:
 
     def run_takeover(self, hosts):
         w = self.outputs["takeover"]
-        hosts = [re.sub(r'^https?://', '', h).split("/")[0] for h in hosts]
+        # dnsx/subzy want bare hostnames (no scheme/path/port)
+        hosts = [re.sub(r'^https?://', '', h).split("/")[0].split(":")[0] for h in hosts]
         outdir = self.state["outdir"] or self._new_outdir(hosts[0])
         infile = os.path.join(outdir, "takeover_hosts.txt")
         with open(infile, "w") as f:
@@ -3119,8 +3123,12 @@ class GhostReconGUI:
         target = re.sub(r'^https?://', '', target).split("/")[0]
         domain = self.vhost_domain.get().strip().lstrip(".")
         wl = self.vhost_wordlist.get().strip()
-        if not is_host(target):
-            messagebox.showwarning("Input", "Enter a valid target host or IP.")
+        # target may carry a :port (e.g. an internal app on :8443) -> validate
+        # the host part only, keep the full target for the request.
+        host_only = target.rsplit(":", 1)[0] if re.search(r':\d+$', target) else target
+        if not is_host(host_only):
+            messagebox.showwarning("Input", "Enter a valid target host or IP "
+                                           "(optionally host:port).")
             return
         if not is_domain(domain):
             messagebox.showwarning("Input", "Enter a valid base domain (e.g. example.com).")
@@ -3357,7 +3365,7 @@ class GhostReconGUI:
         url = self.wpscan_url.get().strip()
         if not url.startswith("http"):
             url = "https://" + url
-        host = re.sub(r'^https?://', '', url).split("/")[0]
+        host = re.sub(r'^https?://', '', url).split("/")[0].split(":")[0]
         if not is_host(host):
             messagebox.showwarning("Input", "Enter a valid WordPress URL.")
             return
@@ -3391,7 +3399,7 @@ class GhostReconGUI:
     # ---- Nikto ---- #
     def start_nikto(self):
         targets = [t for t in self._lines_from(self.nikto_input)
-                   if is_host(re.sub(r'^https?://', '', t).split("/")[0])]
+                   if is_host(re.sub(r'^https?://', '', t).split("/")[0].split(":")[0])]
         targets = self.scope_filter(targets, self.outputs["nikto"])
         if not targets:
             messagebox.showwarning("Input", "No valid in-scope hosts.")
