@@ -360,7 +360,7 @@ def extract_js_secrets(text):
 PROXY_FLAG = {
     "httpx": "-http-proxy", "katana": "-proxy", "nuclei": "-proxy",
     "dnsx": "-proxy", "naabu": "-proxy", "ffuf": "-x",
-    "wpscan": "--proxy", "nikto": "-useproxy",
+    "wpscan": "--proxy", "nikto": "-useproxy", "kr": "--proxy",
 }
 # Requests/sec cap per tool (0/unset = no cap). ffuf/dirb carry their own in the
 # Dir Busting tab, so they're injected there, not globally.
@@ -377,6 +377,7 @@ HEADER_STYLE = {
     "nuclei": ("-H", "repeat"), "ffuf": ("-H", "repeat"),
     "dirb": ("-H", "repeat"), "nikto": ("-Add-header", "repeat"),
     "wpscan": ("--headers", "join"), "arjun": ("--headers", "nl"),
+    "kr": ("-H", "repeat"),
 }
 DEFAULT_SETTINGS = {
     "proxy_on": False, "proxy_url": "http://127.0.0.1:8080",
@@ -1488,7 +1489,7 @@ class GhostReconGUI:
         extra_inputs = [getattr(self, a, None) for a in (
             "hosts_input", "vuln_input", "dirbust_input", "live_feed",
             "js_input", "takeover_input", "params_input", "bypass_input",
-            "nikto_input")]
+            "nikto_input", "api_input")]
         for widget in list(getattr(self, "outputs", {}).values()) + extra_inputs:
             if widget is not None:
                 widget.configure(bg=t["text_bg"], fg=t["text_fg"],
@@ -1680,6 +1681,7 @@ class GhostReconGUI:
         "wpscan": "https://github.com/wpscanteam/wpscan",
         "nikto": "https://github.com/sullo/nikto",
         "js-beautify": "https://github.com/beautifier/js-beautify",
+        "kr": "https://github.com/assetnote/kiterunner",
     }
 
     # How to install each tool. "go"/"pip" entries run without sudo; "apt" needs sudo.
@@ -1706,9 +1708,10 @@ class GhostReconGUI:
         "wpscan":    ("apt", "sudo apt-get install -y wpscan"),
         "nikto":     ("apt", "sudo apt-get install -y nikto"),
         "js-beautify": ("pip", "pip3 install --user jsbeautifier"),
+        "kr":        ("go", "go install github.com/assetnote/kiterunner/cmd/kr@latest"),
     }
     # Tools that are optional enhancers: never block a stage, just improve it.
-    OPTIONAL_TOOLS = {"jsluice", "subzy", "x8", "js-beautify"}
+    OPTIONAL_TOOLS = {"jsluice", "subzy", "x8", "js-beautify", "kr"}
 
     def has_tool(self, name):
         # httpx is special: the name collides with the Python httpx HTTP client.
@@ -2606,6 +2609,7 @@ class GhostReconGUI:
         self._build_takeover_subtab(inner)
         self._build_params_subtab(inner)
         self._build_vhost_subtab(inner)
+        self._build_api_subtab(inner)
 
     # --- JS & Secrets ----------------------------------------------------- #
     def _build_js_subtab(self, nb):
@@ -2723,6 +2727,63 @@ class GhostReconGUI:
                   "/usr/share/seclists/Discovery/DNS/bitquark-subdomains-top100000.txt",
                   "/usr/share/wordlists/amass/subdomains-top1mil-5000.txt",
                   "/usr/share/seclists/Discovery/DNS/namelist.txt"):
+            if os.path.isfile(p):
+                return p
+        return None
+
+    # --- API route discovery (kiterunner) --------------------------------- #
+    def _build_api_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="API Routes")
+        self.api_input = self._mini_targets(
+            tab, "API hosts / base URLs to scan for routes (kiterunner):",
+            [("Load live hosts",
+              lambda: self._fill(self.api_input, self.state.get("live_urls")
+                                 or self.state["live_hosts"])),
+             ("Load checked scope",
+              lambda: self._fill(self.api_input,
+                                 [h[2:] if h.startswith("*.") else h
+                                  for h in self.scope_checked_hosts()]))])
+        wl = ttk.LabelFrame(tab, text="Wordlist", padding=6)
+        wl.grid(row=3, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 2))
+        wl.columnconfigure(1, weight=1)
+        ttk.Label(wl, text="File (.kite or .txt):").grid(row=0, column=0, sticky="w")
+        self.api_wordlist = tk.StringVar(value=self.best_api_wordlist() or "")
+        ttk.Entry(wl, textvariable=self.api_wordlist).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(wl, text="Browse…",
+                   command=lambda: self._browse_wordlist(self.api_wordlist)
+                   ).grid(row=0, column=2)
+        ttk.Label(wl, text="Assetnote list (-A):").grid(row=1, column=0, sticky="w")
+        self.api_assetnote = ttk.Entry(wl)
+        self.api_assetnote.grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(wl, text="e.g. apiroutes-210328 (auto-downloads; overrides file if set)",
+                  foreground="#888").grid(row=1, column=2, sticky="w")
+
+        opt = ttk.Frame(tab)
+        opt.grid(row=4, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text="Preflight depth:").pack(side="left")
+        self.api_depth = tk.IntVar(value=1)
+        ttk.Spinbox(opt, from_=1, to=5, width=4, textvariable=self.api_depth
+                    ).pack(side="left", padx=4)
+        ttk.Label(opt, text="Conns/host:").pack(side="left")
+        self.api_conns = tk.IntVar(value=3)
+        ttk.Spinbox(opt, from_=1, to=20, width=4, textvariable=self.api_conns
+                    ).pack(side="left", padx=4)
+        btn = ttk.Button(tab, text="Scan API routes", command=self.start_kiterunner)
+        btn.grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["api"] = self._make_output(tab)
+
+    @staticmethod
+    def best_api_wordlist():
+        import glob as _glob
+        kites = _glob.glob(os.path.expanduser("~/.cache/kiterunner/*.kite")) \
+            + _glob.glob(os.path.expanduser("~/*.kite")) \
+            + _glob.glob("/usr/share/wordlists/**/*.kite", recursive=True)
+        if kites:
+            return kites[0]
+        for p in ("/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt",
+                  "/usr/share/seclists/Discovery/Web-Content/common-api-endpoints-mazen160.txt"):
             if os.path.isfile(p):
                 return p
         return None
@@ -3104,6 +3165,52 @@ class GhostReconGUI:
             label = (r.get("input", {}) or {}).get("FUZZ") or r.get("url", "")
             out.append((label, r.get("status", ""), r.get("length", "")))
         return out
+
+    # ---- API routes (kiterunner) ---- #
+    def start_kiterunner(self):
+        targets = [t for t in self._lines_from(self.api_input)
+                   if is_host(re.sub(r'^https?://', '', t).split("/")[0].split(":")[0])]
+        targets = self.scope_filter(targets, self.outputs["api"])
+        if not targets:
+            messagebox.showwarning("Input", "No valid in-scope API hosts.")
+            return
+        wl = self.api_wordlist.get().strip()
+        an = self.api_assetnote.get().strip()
+        if not an and not os.path.isfile(wl):
+            messagebox.showwarning("Wordlist", "Choose a .kite/.txt wordlist file, or set "
+                                              "an Assetnote wordlist name (-A).")
+            return
+        self._launch(self.run_kiterunner, self.outputs["api"], (targets, wl, an))
+
+    def run_kiterunner(self, targets, wl, an):
+        w = self.outputs["api"]
+        if not self.require(w, "kr"):
+            self.append(w, "[*] kiterunner (kr) isn't installed. Install via Settings → "
+                           "Install missing tools, or grab a release binary from "
+                           "https://github.com/assetnote/kiterunner/releases\n")
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', targets[0]).split("/")[0])
+        infile = os.path.join(outdir, "kr_targets.txt")
+        with open(infile, "w") as f:
+            f.write("\n".join(targets) + "\n")
+        out = os.path.join(outdir, "kiterunner.txt")
+        cmd = ["kr", "scan", infile, "-o", "text",
+               "-d", str(max(1, self.api_depth.get())),
+               "-x", str(max(1, self.api_conns.get()))]
+        if an:
+            cmd += ["-A", an]      # named Assetnote wordlist (auto-downloads)
+        else:
+            cmd += ["-w", wl]      # local .kite or .txt
+        if self.gopts["rate"]:     # kr throttles by delay, not req/s
+            cmd += ["--delay", f"{max(1, int(1000 / self.gopts['rate']))}ms"]
+        cmd = self.augment(cmd, "kr")   # proxy + headers
+        self.update_status(f"kiterunner on {len(targets)} host(s) ...")
+        self.append(w, f"[*] Scanning {len(targets)} host(s) with "
+                       f"{'Assetnote ' + an if an else os.path.basename(wl)}\n")
+        self.run_stream(cmd, w, outfile=out)
+        self.append(w, f"\n[+] kiterunner done -> {out}\n")
+        self.update_status("API route scan done.")
 
     # ---- 403 bypass ---- #
     BYPASS_PATHS = [

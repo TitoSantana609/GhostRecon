@@ -40,6 +40,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
   - **Takeover** — maps dangling CNAMEs with `dnsx` and checks for **subdomain takeover** with `nuclei` takeover templates and, when installed, **`subzy`**.
   - **Params** — hidden-parameter discovery with **`arjun`** (GET/POST/JSON/XML, threads, honouring your global headers and rate).
   - **Vhosts** — virtual-host fuzzing with `ffuf` (`Host: FUZZ.<domain>`), auto-calibrated so only real vhosts surface.
+  - **API Routes** — API endpoint discovery with **`kiterunner`** (`kr scan`). Point it at a local `.kite`/`.txt` wordlist or a named **Assetnote** wordlist (`-A`, auto-downloaded), set preflight depth and connections/host, and it honours the global Burp proxy, headers and rate (converted to `--delay`).
 - **Web Scan tab** (grouped sub-tabs):
   - **403 Bypass** — tries path mutations (`/.`, `//`, `/..;/`, `%2e`, trailing slash, extensions…), header tricks (`X-Forwarded-For`, `X-Original-URL`, `X-Rewrite-URL`, …) and alternate methods against a forbidden URL, flagging anything that turns a 401/403 into 2xx. Can load the 401/403 rows straight from Dir Busting.
   - **WPScan** — WordPress scan with enumeration of vulnerable plugins/themes/users, config backups, `--stealthy`, and an optional API token for CVE data.
@@ -77,6 +78,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
 | jsluice *(optional)* | `go install github.com/BishopFox/jsluice/cmd/jsluice@latest` |
 | arjun | `pipx install arjun` |
 | js-beautify *(optional)* | `pip3 install --user jsbeautifier` |
+| kiterunner (`kr`) | `go install github.com/assetnote/kiterunner/cmd/kr@latest` (or a [release binary](https://github.com/assetnote/kiterunner/releases)) |
 | wpscan | `sudo apt install wpscan` |
 | nikto | `sudo apt install nikto` |
 | curl | `sudo apt install curl` (used by JS fetch + 403 bypass) |
