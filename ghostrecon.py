@@ -304,6 +304,38 @@ def extract_js_endpoints(text):
                   and len(e) <= 200)
 
 
+def beautify_js(code):
+    """Reformat minified JS into readable, indented multi-line code.
+
+    Returns (text, method). Prefers the pure-Python jsbeautifier library (no
+    Node needed); falls back to the js-beautify CLI; else returns code as-is.
+    Note: this reflows whitespace/statements -- it does NOT rename mangled
+    variables (true de-obfuscation needs heavier, Node-based tooling).
+    """
+    if not code or not code.strip():
+        return code, "none"
+    try:
+        import jsbeautifier
+        opts = jsbeautifier.default_options()
+        opts.indent_size = 2
+        opts.max_preserve_newlines = 2
+        return jsbeautifier.beautify(code, opts), "jsbeautifier"
+    except ImportError:
+        pass
+    except Exception:
+        return code, "error"
+    exe = shutil.which("js-beautify")
+    if exe:
+        try:
+            r = subprocess.run([exe, "-"], input=code, capture_output=True,
+                               text=True, timeout=40)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout, "js-beautify cli"
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return code, "none"
+
+
 def extract_js_secrets(text):
     out = []
     seen = set()
@@ -1647,6 +1679,7 @@ class GhostReconGUI:
         "jsluice": "https://github.com/BishopFox/jsluice",
         "wpscan": "https://github.com/wpscanteam/wpscan",
         "nikto": "https://github.com/sullo/nikto",
+        "js-beautify": "https://github.com/beautifier/js-beautify",
     }
 
     # How to install each tool. "go"/"pip" entries run without sudo; "apt" needs sudo.
@@ -1672,9 +1705,10 @@ class GhostReconGUI:
         "arjun":     ("pip", "pipx install arjun 2>/dev/null || pip3 install --user arjun"),
         "wpscan":    ("apt", "sudo apt-get install -y wpscan"),
         "nikto":     ("apt", "sudo apt-get install -y nikto"),
+        "js-beautify": ("pip", "pip3 install --user jsbeautifier"),
     }
     # Tools that are optional enhancers: never block a stage, just improve it.
-    OPTIONAL_TOOLS = {"jsluice", "subzy", "x8"}
+    OPTIONAL_TOOLS = {"jsluice", "subzy", "x8", "js-beautify"}
 
     def has_tool(self, name):
         # httpx is special: the name collides with the Python httpx HTTP client.
@@ -2586,10 +2620,13 @@ class GhostReconGUI:
         self.js_crawl = tk.BooleanVar(value=True)
         self.js_endpoints = tk.BooleanVar(value=True)
         self.js_secrets = tk.BooleanVar(value=True)
+        self.js_beautify = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="Crawl hosts with katana to find .js (if inputs aren't .js)",
                         variable=self.js_crawl).pack(side="left")
         ttk.Checkbutton(opt, text="Endpoints", variable=self.js_endpoints).pack(side="left", padx=6)
         ttk.Checkbutton(opt, text="Secrets", variable=self.js_secrets).pack(side="left")
+        ttk.Checkbutton(opt, text="Beautify (unminify)",
+                        variable=self.js_beautify).pack(side="left", padx=6)
         btn = ttk.Button(tab, text="Analyze JavaScript", command=self.start_js)
         btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
         self.run_buttons.append(btn)
@@ -2837,6 +2874,9 @@ class GhostReconGUI:
         self.append(w, f"[*] Analyzing {len(js_urls)} JS file(s) ...\n")
         has_jsluice = self.has_tool("jsluice")
         all_ep, all_sec = set(), []
+        beautify_on = self.js_beautify.get()
+        bdir = os.path.join(outdir, "js_beautified")
+        warned_no_beautify = [False]
         for i, ju in enumerate(js_urls, 1):
             if self.stop_requested:
                 self.append(w, "\n[!] Stopped.\n")
@@ -2863,6 +2903,23 @@ class GhostReconGUI:
                     pass
             if not body:
                 continue
+            if beautify_on:
+                pretty, method = beautify_js(body)
+                if method in ("jsbeautifier", "js-beautify cli"):
+                    body = pretty
+                    os.makedirs(bdir, exist_ok=True)
+                    stem = re.sub(r'\.js(\?.*)?$', '', re.sub(r'^https?://', '', ju), flags=re.I)
+                    name = (sanitize_for_path(stem) or "script")[:120]
+                    try:
+                        with open(os.path.join(bdir, name + ".js"), "w") as bf:
+                            bf.write(pretty)
+                    except OSError:
+                        pass
+                elif method == "none" and not warned_no_beautify[0]:
+                    warned_no_beautify[0] = True
+                    self.append(w, "[*] No JS beautifier found — analyzing minified "
+                                   "source. Install via Settings → Install missing tools "
+                                   "(js-beautify) for readable output.\n")
             eps, secs = [], []
             if self.js_endpoints.get():
                 eps = extract_js_endpoints(body)
@@ -2902,6 +2959,8 @@ class GhostReconGUI:
                 self.append(w, f"  [{lbl}] {v}\n")
         else:
             self.append(w, "\n[*] No secrets matched.\n")
+        if beautify_on and os.path.isdir(bdir):
+            self.append(w, f"\n[*] Beautified JS saved in {bdir}/\n")
         self.update_status(f"JS analysis done: {len(all_ep)} endpoints, {len(all_sec)} secrets")
 
     # ---- Takeover ---- #

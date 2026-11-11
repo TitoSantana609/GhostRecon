@@ -36,7 +36,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
   - **Live request feed:** every word tested scrolls by with its response code and size (color-coded, hits in bold), under a status line showing tested/total, %, req/s, hit count and elapsed time — so you can tell a slow, throttled scan from a stalled one.
   - **Throttling** so you don't overload the server or trip a WAF: presets (Aggressive / Normal / Polite / Stealth) or custom threads + max requests/sec, random delay jitter, and a browser User-Agent. The rate cap applies to dirb too (converted to its `-z` delay).
 - **Recon+ tab** (grouped sub-tabs):
-  - **JS & Secrets** — crawls hosts with `katana` to collect `.js` files (or takes `.js` URLs directly), fetches each one, and extracts **endpoints/API paths** and **likely secrets** (Google/AWS/Slack/Stripe/GitHub keys, JWTs, authorization headers, generic `apiKey`/`secret`/`token` assignments). Works with a built-in Python extractor, and uses **`jsluice`** too when installed.
+  - **JS & Secrets** — crawls hosts with `katana` to collect `.js` files (or takes `.js` URLs directly), fetches each one, and extracts **endpoints/API paths** and **likely secrets** (Google/AWS/Slack/Stripe/GitHub keys, JWTs, authorization headers, generic `apiKey`/`secret`/`token` assignments). Works with a built-in Python extractor, and uses **`jsluice`** too when installed. A **Beautify (unminify)** option reformats minified one-liners into readable, indented code (via the pure-Python `jsbeautifier`, or the `js-beautify` CLI) and saves a readable copy of each file under `js_beautified/` — note this reflows the code, it doesn't rename mangled variables.
   - **Takeover** — maps dangling CNAMEs with `dnsx` and checks for **subdomain takeover** with `nuclei` takeover templates and, when installed, **`subzy`**.
   - **Params** — hidden-parameter discovery with **`arjun`** (GET/POST/JSON/XML, threads, honouring your global headers and rate).
   - **Vhosts** — virtual-host fuzzing with `ffuf` (`Host: FUZZ.<domain>`), auto-calibrated so only real vhosts surface.
@@ -76,6 +76,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
 | subzy *(optional)* | `go install -v github.com/PentestPad/subzy@latest` |
 | jsluice *(optional)* | `go install github.com/BishopFox/jsluice/cmd/jsluice@latest` |
 | arjun | `pipx install arjun` |
+| js-beautify *(optional)* | `pip3 install --user jsbeautifier` |
 | wpscan | `sudo apt install wpscan` |
 | nikto | `sudo apt install nikto` |
 | curl | `sudo apt install curl` (used by JS fetch + 403 bypass) |
