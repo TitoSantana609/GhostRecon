@@ -2904,7 +2904,8 @@ class GhostReconGUI:
                "-m", self.params_method.get(),
                "-t", str(max(1, self.params_threads.get()))]
         if self.gopts["rate"]:
-            cmd += ["--rate-limit", str(self.gopts["rate"])]
+            # arjun has no req/s flag; -d adds a per-request delay instead.
+            cmd += ["-d", str(round(1.0 / self.gopts["rate"], 2))]
         if self._proxy_url():
             self.append(w, "[*] Note: arjun has no proxy option; its traffic won't "
                            "go through Burp.\n")
