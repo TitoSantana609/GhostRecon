@@ -257,6 +257,70 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 # --------------------------------------------------------------------------- #
+# JavaScript analysis: pull endpoints + secrets out of .js source (no deps, so
+# it works without jsluice; jsluice is used too when present for richer results)
+# --------------------------------------------------------------------------- #
+JS_URL_RE = re.compile(r'''https?://[^\s'"`<>()]{3,}''')
+JS_PATH_RE = re.compile(r'''['"`](/[A-Za-z0-9_./~-][^\s'"`<>]{1,120})['"`]''')
+JS_APICALL_RE = re.compile(
+    r'''(?:fetch|axios|\.(?:get|post|put|delete|patch|ajax|open))\s*\(\s*'''
+    r'''['"`]([^'"`]{2,160})['"`]''', re.I)
+# (label, regex) -- secret-ish tokens worth a manual look.
+JS_SECRET_PATTERNS = [
+    ("google_api_key", re.compile(r'AIza[0-9A-Za-z_\-]{35}')),
+    ("aws_access_key", re.compile(r'A(?:KIA|SIA|GPA|IDA|ROA)[0-9A-Z]{16}')),
+    ("slack_token", re.compile(r'xox[baprs]-[0-9A-Za-z-]{10,48}')),
+    ("slack_webhook", re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9/+]{20,}')),
+    ("stripe_key", re.compile(r'[sr]k_live_[0-9A-Za-z]{20,40}')),
+    ("github_token", re.compile(r'gh[pousr]_[0-9A-Za-z]{30,}')),
+    ("google_oauth", re.compile(r'ya29\.[0-9A-Za-z_\-]{20,}')),
+    ("jwt", re.compile(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}')),
+    ("firebase_db", re.compile(r'[a-z0-9.-]+\.firebaseio\.com')),
+    ("private_key", re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----')),
+    ("authorization", re.compile(r'[Aa]uthorization["\']?\s*[:=]\s*["\']?'
+                                 r'(?:Bearer|Basic)\s+[A-Za-z0-9._\-+/=]{10,}')),
+    ("generic_secret", re.compile(
+        r'(?i)(?:api[_-]?key|apikey|secret|client[_-]?secret|access[_-]?token|'
+        r'auth[_-]?token|password|passwd)["\']?\s*[:=]\s*["\']([^"\'\s]{8,64})["\']')),
+]
+# Things that look like secrets but aren't worth reporting.
+JS_SECRET_IGNORE = re.compile(r'(?i)(example|xxxx|your[_-]?|placeholder|null|undefined|'
+                              r'process\.env|import\.meta|\{\{|\}\})')
+
+
+def extract_js_endpoints(text):
+    found = set()
+    for m in JS_URL_RE.finditer(text):
+        found.add(m.group(0).rstrip('\\'))
+    for m in JS_PATH_RE.finditer(text):
+        p = m.group(1)
+        if not re.fullmatch(r'/[\d.]+', p):          # skip bare "/1.2"
+            found.add(p)
+    for m in JS_APICALL_RE.finditer(text):
+        found.add(m.group(1))
+    # drop obvious noise: css/image data and single-segment junk
+    return sorted(e for e in found
+                  if not e.lower().startswith(("data:", "blob:"))
+                  and len(e) <= 200)
+
+
+def extract_js_secrets(text):
+    out = []
+    seen = set()
+    for label, rx in JS_SECRET_PATTERNS:
+        for m in rx.finditer(text):
+            hit = m.group(0)
+            if JS_SECRET_IGNORE.search(hit):
+                continue
+            key = (label, hit)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((label, hit.strip()))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Global request options (proxy / headers / rate) -- how each tool spells them.
 # Tools absent from a table simply don't get that option injected.
 # --------------------------------------------------------------------------- #
@@ -312,8 +376,8 @@ class GhostReconGUI:
     def __init__(self, master):
         self.master = master
         master.title("GhostRecon — @TitoSantana00")
-        master.geometry("1000x760")
-        master.minsize(820, 620)
+        master.geometry("1200x800")
+        master.minsize(900, 640)
 
         self.theme_name = "dark"
         self.running = False
@@ -613,6 +677,8 @@ class GhostReconGUI:
         self._build_port_tab()
         self._build_vuln_tab()
         self._build_dirbust_tab()
+        self._build_reconplus_tab()
+        self._build_webscan_tab()
 
         # Bottom control/status bar
         bottom = ttk.Frame(self.master, padding=(8, 4))
@@ -647,6 +713,7 @@ class GhostReconGUI:
         sb = ttk.Scrollbar(frame, command=text.yview)
         sb.grid(row=0, column=1, sticky="ns")
         text["yscrollcommand"] = sb.set
+        text._gr_output = True   # marks the Save/Clear "active tab" target
         return text
 
     # --- Tab: Scope ------------------------------------------------------- #
@@ -726,6 +793,7 @@ class GhostReconGUI:
         text = tk.Text(log, wrap=tk.WORD, state="disabled", height=4,
                        font=("Courier New", 10), relief=tk.FLAT, bd=0)
         text.grid(row=0, column=0, sticky="ew")
+        text._gr_output = True
         self.outputs["scope"] = text   # keep aligned with tab order (first tab)
 
     def _scope_load_file(self):
@@ -1142,6 +1210,7 @@ class GhostReconGUI:
         lsb.grid(row=0, column=1, sticky="ns")
         text["yscrollcommand"] = lsb.set
         paned.add(log, weight=1)
+        text._gr_output = True
         self.outputs["dir"] = text
 
     # Live feed plumbing: workers push into a queue, the Tk loop drains it in
@@ -1325,9 +1394,11 @@ class GhostReconGUI:
                        foreground=[("selected", "#ffffff")])
         self.style.configure("Treeview.Heading", background=t["tab_bg"], foreground=t["tab_fg"])
         self.style.map("Treeview.Heading", background=[("active", t["bg"])])
-        for widget in list(getattr(self, "outputs", {}).values()) + \
-                [getattr(self, "hosts_input", None), getattr(self, "vuln_input", None),
-                 getattr(self, "dirbust_input", None), getattr(self, "live_feed", None)]:
+        extra_inputs = [getattr(self, a, None) for a in (
+            "hosts_input", "vuln_input", "dirbust_input", "live_feed",
+            "js_input", "takeover_input", "params_input", "bypass_input",
+            "nikto_input")]
+        for widget in list(getattr(self, "outputs", {}).values()) + extra_inputs:
             if widget is not None:
                 widget.configure(bg=t["text_bg"], fg=t["text_fg"],
                                  insertbackground=t["text_fg"])
@@ -1354,8 +1425,32 @@ class GhostReconGUI:
             w.config(state="disabled")
 
     def _active_widget(self):
-        idx = self.notebook.index(self.notebook.select())
-        return list(self.outputs.values())[idx]
+        """The output Text of the currently visible tab, descending through any
+        nested notebook to its selected sub-tab. Robust to tab add/reorder."""
+        try:
+            frame = self.master.nametowidget(self.notebook.select())
+        except (KeyError, tk.TclError):
+            return next(iter(self.outputs.values()), None)
+        return self._find_output(frame) or next(iter(self.outputs.values()), None)
+
+    def _find_output(self, widget):
+        # Prefer a nested notebook's currently-selected sub-tab.
+        for child in widget.winfo_children():
+            if isinstance(child, ttk.Notebook):
+                try:
+                    sub = self.master.nametowidget(child.select())
+                except (KeyError, tk.TclError):
+                    continue
+                found = self._find_output(sub)
+                if found:
+                    return found
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Text) and getattr(child, "_gr_output", False):
+                return child
+            found = self._find_output(child)
+            if found:
+                return found
+        return None
 
     def save_active_output(self):
         w = self._active_widget()
@@ -1487,6 +1582,12 @@ class GhostReconGUI:
         "nuclei": "https://github.com/projectdiscovery/nuclei",
         "dirb": "https://dirb.sourceforge.net",
         "ffuf": "https://github.com/ffuf/ffuf",
+        "dnsx": "https://github.com/projectdiscovery/dnsx",
+        "subzy": "https://github.com/PentestPad/subzy",
+        "arjun": "https://github.com/s0md3v/Arjun",
+        "jsluice": "https://github.com/BishopFox/jsluice",
+        "wpscan": "https://github.com/wpscanteam/wpscan",
+        "nikto": "https://github.com/sullo/nikto",
     }
 
     # How to install each tool. "go"/"pip" entries run without sudo; "apt" needs sudo.
@@ -1506,7 +1607,15 @@ class GhostReconGUI:
         "curl":      ("apt", "sudo apt-get install -y curl"),
         "ffuf":      ("go", "go install github.com/ffuf/ffuf/v2@latest"),
         "dirb":      ("apt", "sudo apt-get install -y dirb"),
+        "dnsx":      ("go", "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"),
+        "subzy":     ("go", "go install -v github.com/PentestPad/subzy@latest"),
+        "jsluice":   ("go", "go install github.com/BishopFox/jsluice/cmd/jsluice@latest"),
+        "arjun":     ("pip", "pipx install arjun 2>/dev/null || pip3 install --user arjun"),
+        "wpscan":    ("apt", "sudo apt-get install -y wpscan"),
+        "nikto":     ("apt", "sudo apt-get install -y nikto"),
     }
+    # Tools that are optional enhancers: never block a stage, just improve it.
+    OPTIONAL_TOOLS = {"jsluice", "subzy", "x8"}
 
     def has_tool(self, name):
         # httpx is special: the name collides with the Python httpx HTTP client.
@@ -2360,6 +2469,667 @@ class GhostReconGUI:
         else:
             self.append(w, "[!] Calibration found no stable not-found signature.\n")
         return calib
+
+    # ================================================================== #
+    # Recon+ tab (JS & Secrets · Takeover · Params · Vhosts)
+    # ================================================================== #
+    def _mini_targets(self, parent, label, load_buttons):
+        """A small multiline target box + a row of 'load from stage' buttons.
+        load_buttons: list of (text, callable). Returns the Text widget."""
+        ttk.Label(parent, text=label).grid(row=0, column=0, columnspan=4,
+                                           sticky="w", padx=4, pady=(4, 0))
+        box = tk.Text(parent, height=4, wrap=tk.NONE, font=("Courier New", 10))
+        box.grid(row=1, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+        parent.columnconfigure(0, weight=1)
+        bar = ttk.Frame(parent)
+        bar.grid(row=2, column=0, columnspan=4, sticky="w", padx=4)
+        for text, cmd in load_buttons:
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 4))
+        return box
+
+    def _fill(self, widget, items, kind="text"):
+        if not items:
+            messagebox.showinfo("No data", "Nothing available from that stage yet.")
+            return
+        if kind == "text":
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", "\n".join(items))
+        else:
+            widget.delete(0, tk.END)
+            widget.insert(0, items[0])
+
+    def _build_reconplus_tab(self):
+        outer = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(outer, text="7. Recon+")
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        inner = ttk.Notebook(outer)
+        inner.grid(row=0, column=0, sticky="nsew")
+        self._build_js_subtab(inner)
+        self._build_takeover_subtab(inner)
+        self._build_params_subtab(inner)
+        self._build_vhost_subtab(inner)
+
+    # --- JS & Secrets ----------------------------------------------------- #
+    def _build_js_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="JS & Secrets")
+        self.js_input = self._mini_targets(
+            tab, "JavaScript URLs, or page URLs/hosts to crawl for .js:",
+            [("Load URLs (stage 3)", lambda: self._fill(self.js_input, self.state["urls"])),
+             ("Load live hosts", lambda: self._fill(self.js_input, self.state["live_hosts"]))])
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        self.js_crawl = tk.BooleanVar(value=True)
+        self.js_endpoints = tk.BooleanVar(value=True)
+        self.js_secrets = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="Crawl hosts with katana to find .js (if inputs aren't .js)",
+                        variable=self.js_crawl).pack(side="left")
+        ttk.Checkbutton(opt, text="Endpoints", variable=self.js_endpoints).pack(side="left", padx=6)
+        ttk.Checkbutton(opt, text="Secrets", variable=self.js_secrets).pack(side="left")
+        btn = ttk.Button(tab, text="Analyze JavaScript", command=self.start_js)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["js"] = self._make_output(tab)
+
+    # --- Subdomain takeover ----------------------------------------------- #
+    def _build_takeover_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Takeover")
+        self.takeover_input = self._mini_targets(
+            tab, "Subdomains / hosts to check for dangling CNAME takeover:",
+            [("Load subdomains (stage 1)",
+              lambda: self._fill(self.takeover_input, self.state["subdomains"])),
+             ("Load live hosts",
+              lambda: self._fill(self.takeover_input, self.state["live_hosts"])),
+             ("Load checked scope",
+              lambda: self._fill(self.takeover_input,
+                                 [h[2:] if h.startswith("*.") else h
+                                  for h in self.scope_checked_hosts()]))])
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        self.tko_dnsx = tk.BooleanVar(value=True)
+        self.tko_nuclei = tk.BooleanVar(value=True)
+        self.tko_subzy = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="dnsx CNAME map", variable=self.tko_dnsx).pack(side="left")
+        ttk.Checkbutton(opt, text="nuclei takeover templates",
+                        variable=self.tko_nuclei).pack(side="left", padx=6)
+        ttk.Checkbutton(opt, text="subzy (if installed)",
+                        variable=self.tko_subzy).pack(side="left")
+        btn = ttk.Button(tab, text="Check takeovers", command=self.start_takeover)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["takeover"] = self._make_output(tab)
+
+    # --- Parameter discovery (arjun) -------------------------------------- #
+    def _build_params_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Params")
+        self.params_input = self._mini_targets(
+            tab, "URLs/endpoints to probe for hidden parameters (arjun):",
+            [("Load URLs (stage 3)",
+              lambda: self._fill(self.params_input, self.state["urls"])),
+             ("Load live URLs",
+              lambda: self._fill(self.params_input, self.state.get("live_urls", [])))])
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text="Method:").pack(side="left")
+        self.params_method = ttk.Combobox(opt, state="readonly", width=6,
+                                          values=["GET", "POST", "JSON", "XML"])
+        self.params_method.set("GET")
+        self.params_method.pack(side="left", padx=4)
+        ttk.Label(opt, text="Threads:").pack(side="left")
+        self.params_threads = tk.IntVar(value=5)
+        ttk.Spinbox(opt, from_=1, to=50, width=5,
+                    textvariable=self.params_threads).pack(side="left", padx=4)
+        btn = ttk.Button(tab, text="Find parameters", command=self.start_params)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["params"] = self._make_output(tab)
+
+    # --- Virtual-host fuzzing --------------------------------------------- #
+    def _build_vhost_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Vhosts")
+        tab.columnconfigure(1, weight=1)
+        ttk.Label(tab, text="Target (host or IP to send requests to):"
+                  ).grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        self.vhost_target = ttk.Entry(tab)
+        self.vhost_target.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Label(tab, text="Base domain (FUZZ.<base> in Host header):"
+                  ).grid(row=1, column=0, sticky="w", padx=4, pady=3)
+        self.vhost_domain = ttk.Entry(tab)
+        self.vhost_domain.grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Label(tab, text="Wordlist:").grid(row=2, column=0, sticky="w", padx=4, pady=3)
+        wlf = ttk.Frame(tab)
+        wlf.grid(row=2, column=1, sticky="ew", padx=4)
+        wlf.columnconfigure(0, weight=1)
+        self.vhost_wordlist = tk.StringVar(value=self.best_vhost_wordlist() or "")
+        ttk.Entry(wlf, textvariable=self.vhost_wordlist).grid(row=0, column=0, sticky="ew")
+        ttk.Button(wlf, text="Browse…",
+                   command=lambda: self._browse_wordlist(self.vhost_wordlist)
+                   ).grid(row=0, column=1, padx=4)
+        self.vhost_https = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tab, text="Use HTTPS", variable=self.vhost_https
+                        ).grid(row=3, column=1, sticky="w", padx=4)
+        btn = ttk.Button(tab, text="Fuzz virtual hosts", command=self.start_vhost)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["vhost"] = self._make_output(tab)
+
+    @staticmethod
+    def best_vhost_wordlist():
+        for p in ("/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt",
+                  "/usr/share/seclists/Discovery/DNS/bitquark-subdomains-top100000.txt",
+                  "/usr/share/wordlists/amass/subdomains-top1mil-5000.txt",
+                  "/usr/share/seclists/Discovery/DNS/namelist.txt"):
+            if os.path.isfile(p):
+                return p
+        return None
+
+    # ================================================================== #
+    # Web Scan tab (403 Bypass · WPScan · Nikto)
+    # ================================================================== #
+    def _build_webscan_tab(self):
+        outer = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(outer, text="8. Web Scan")
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        inner = ttk.Notebook(outer)
+        inner.grid(row=0, column=0, sticky="nsew")
+        self._build_bypass_subtab(inner)
+        self._build_wpscan_subtab(inner)
+        self._build_nikto_subtab(inner)
+
+    # --- 403 bypass ------------------------------------------------------- #
+    def _build_bypass_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="403 Bypass")
+        self.bypass_input = self._mini_targets(
+            tab, "Forbidden/▲401 URLs to try to bypass (one per line):",
+            [("Load 403/401 from Dir Busting", self._load_forbidden_dirs)])
+        btn = ttk.Button(tab, text="Try bypass techniques", command=self.start_bypass)
+        btn.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["bypass"] = self._make_output(tab)
+
+    def _load_forbidden_dirs(self):
+        urls = []
+        for iid in getattr(self, "dirbust_tree", None).get_children() \
+                if getattr(self, "dirbust_tree", None) else []:
+            vals = self.dirbust_tree.item(iid)["values"]
+            if len(vals) >= 2 and str(vals[1]) in ("401", "403"):
+                urls.append(str(vals[0]))
+        self._fill(self.bypass_input, urls)
+
+    # --- WPScan ----------------------------------------------------------- #
+    def _build_wpscan_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="WPScan")
+        tab.columnconfigure(1, weight=1)
+        ttk.Label(tab, text="WordPress URL:").grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        self.wpscan_url = ttk.Entry(tab)
+        self.wpscan_url.grid(row=0, column=1, sticky="ew", padx=4)
+        opt = ttk.Frame(tab)
+        opt.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=2)
+        self.wp_enum = {}
+        for code, label in (("vp", "vuln plugins"), ("vt", "vuln themes"),
+                            ("u", "users"), ("cb", "config backups")):
+            var = tk.BooleanVar(value=code in ("vp", "u"))
+            self.wp_enum[code] = var
+            ttk.Checkbutton(opt, text=label, variable=var).pack(side="left", padx=3)
+        self.wp_stealth = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="stealthy", variable=self.wp_stealth).pack(side="left", padx=6)
+        tok = ttk.Frame(tab)
+        tok.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
+        ttk.Label(tok, text="API token (optional, for CVE data):").pack(side="left")
+        self.wp_token = ttk.Entry(tok, show="*")
+        self.wp_token.pack(side="left", fill="x", expand=True, padx=4)
+        btn = ttk.Button(tab, text="Scan WordPress", command=self.start_wpscan)
+        btn.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["wpscan"] = self._make_output(tab)
+
+    # --- Nikto ------------------------------------------------------------ #
+    def _build_nikto_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Nikto")
+        self.nikto_input = self._mini_targets(
+            tab, "URLs / hosts for a Nikto web-server scan:",
+            [("Load live hosts",
+              lambda: self._fill(self.nikto_input, self.state.get("live_urls")
+                                 or self.state["live_hosts"]))])
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text="Tuning:").pack(side="left")
+        self.nikto_tuning = ttk.Entry(opt, width=12)
+        self.nikto_tuning.pack(side="left", padx=4)
+        ttk.Label(opt, text="(e.g. 1234b; blank = default)").pack(side="left")
+        self.nikto_ssl = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text="Force SSL", variable=self.nikto_ssl).pack(side="left", padx=6)
+        btn = ttk.Button(tab, text="Run Nikto", command=self.start_nikto)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["nikto"] = self._make_output(tab)
+
+    # ------------------------------------------------------------------ #
+    # Recon+/Web Scan runners
+    # ------------------------------------------------------------------ #
+    def _lines_from(self, widget):
+        return [ln.strip() for ln in widget.get("1.0", tk.END).splitlines() if ln.strip()]
+
+    def _curl_probe(self, url, extra_headers=None, method="GET", resolve=None):
+        """curl returning (status, size) for url, honouring global proxy/headers.
+        Returns (None, None) on error."""
+        cmd = ["curl", "-s", "-k", "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
+               "--max-time", "12", "-X", method]
+        if self._proxy_url():
+            cmd += ["-x", self._proxy_url()]
+        for h in self._all_headers():
+            cmd += ["-H", h]
+        for h in (extra_headers or []):
+            cmd += ["-H", h]
+        if resolve:
+            cmd += ["--resolve", resolve]
+        cmd.append(url)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            code, _, size = r.stdout.strip().partition(" ")
+            return code or None, size or "0"
+        except (subprocess.SubprocessError, OSError):
+            return None, None
+
+    # ---- JS analysis ---- #
+    def start_js(self):
+        items = self._lines_from(self.js_input)
+        if not items:
+            messagebox.showwarning("Input", "Enter JS URLs or hosts.")
+            return
+        self._launch(self.run_js, self.outputs["js"], (items,))
+
+    def run_js(self, items):
+        w = self.outputs["js"]
+        if not self.require(w, "curl"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', items[0]).split("/")[0])
+        js_urls = [u for u in items if re.search(r'\.js(\?|$)', u, re.I)]
+        hosts = [u for u in items if u not in js_urls]
+        if hosts and self.js_crawl.get() and self.has_tool("katana"):
+            self.append(w, f"[*] Crawling {len(hosts)} host(s) with katana for .js URLs ...\n")
+            for h in hosts:
+                if self.stop_requested:
+                    break
+                url = h if h.startswith("http") else f"https://{h}"
+                lines = self.run_stream(self.augment(
+                    ["katana", "-u", url, "-silent", "-jc", "-d", "2"], "katana"), w)
+                js_urls += [ln.strip() for ln in lines if re.search(r'\.js(\?|$)', ln, re.I)]
+        elif hosts and not self.has_tool("katana"):
+            self.append(w, "[!] katana not installed; treating all inputs as JS URLs.\n")
+            js_urls = items
+        js_urls = sorted(set(js_urls))
+        if not js_urls:
+            self.append(w, "[!] No .js URLs found to analyze.\n")
+            return
+        self.append(w, f"[*] Analyzing {len(js_urls)} JS file(s) ...\n")
+        has_jsluice = self.has_tool("jsluice")
+        all_ep, all_sec = set(), []
+        for i, ju in enumerate(js_urls, 1):
+            if self.stop_requested:
+                self.append(w, "\n[!] Stopped.\n")
+                break
+            self.update_status(f"JS {i}/{len(js_urls)}: {ju[:60]}")
+            tmp = tempfile.NamedTemporaryFile("w+", suffix=".js", delete=False)
+            tmp.close()
+            cmd = ["curl", "-s", "-k", "--max-time", "20", "-o", tmp.name]
+            if self._proxy_url():
+                cmd += ["-x", self._proxy_url()]
+            for h in self._all_headers():
+                cmd += ["-H", h]
+            cmd.append(ju)
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=25)
+                body = open(tmp.name, errors="replace").read()
+            except (subprocess.SubprocessError, OSError) as e:
+                self.append(w, f"[!] {ju}: {e}\n")
+                body = ""
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+            if not body:
+                continue
+            eps, secs = [], []
+            if self.js_endpoints.get():
+                eps = extract_js_endpoints(body)
+            if self.js_secrets.get():
+                secs = extract_js_secrets(body)
+            if has_jsluice:
+                try:
+                    jr = subprocess.run(["jsluice", "urls", "-"], input=body,
+                                        capture_output=True, text=True, timeout=20)
+                    for line in jr.stdout.splitlines():
+                        try:
+                            eps.append(json.loads(line).get("url", ""))
+                        except ValueError:
+                            pass
+                except (subprocess.SubprocessError, OSError):
+                    pass
+            all_ep.update(e for e in eps if e)
+            for s in secs:
+                if s not in all_sec:
+                    all_sec.append(s)
+            self.append(w, f"[+] {ju}  ->  {len(eps)} endpoints, {len(secs)} secrets\n")
+        ep_file = os.path.join(outdir, "js_endpoints.txt")
+        with open(ep_file, "w") as f:
+            f.write("\n".join(sorted(all_ep)) + ("\n" if all_ep else ""))
+        self.state.setdefault("js_endpoints", [])
+        self.state["js_endpoints"] = sorted(all_ep)
+        self.append(w, f"\n=== {len(all_ep)} unique endpoints -> {ep_file} ===\n")
+        for e in sorted(all_ep):
+            self.append(w, f"  {e}\n")
+        if all_sec:
+            sec_file = os.path.join(outdir, "js_secrets.txt")
+            with open(sec_file, "w") as f:
+                for lbl, v in all_sec:
+                    f.write(f"{lbl}\t{v}\n")
+            self.append(w, f"\n=== {len(all_sec)} possible secrets -> {sec_file} ===\n")
+            for lbl, v in all_sec:
+                self.append(w, f"  [{lbl}] {v}\n")
+        else:
+            self.append(w, "\n[*] No secrets matched.\n")
+        self.update_status(f"JS analysis done: {len(all_ep)} endpoints, {len(all_sec)} secrets")
+
+    # ---- Takeover ---- #
+    def start_takeover(self):
+        hosts = [h for h in self._lines_from(self.takeover_input)
+                 if is_host(re.sub(r'^https?://', '', h).split("/")[0])]
+        hosts = self.scope_filter(hosts, self.outputs["takeover"])
+        if not hosts:
+            messagebox.showwarning("Input", "No valid in-scope hosts.")
+            return
+        self._launch(self.run_takeover, self.outputs["takeover"], (hosts,))
+
+    def run_takeover(self, hosts):
+        w = self.outputs["takeover"]
+        hosts = [re.sub(r'^https?://', '', h).split("/")[0] for h in hosts]
+        outdir = self.state["outdir"] or self._new_outdir(hosts[0])
+        infile = os.path.join(outdir, "takeover_hosts.txt")
+        with open(infile, "w") as f:
+            f.write("\n".join(hosts) + "\n")
+        did = False
+        if self.tko_dnsx.get() and self.require(w, "dnsx"):
+            did = True
+            self.append(w, "\n=== dnsx CNAME map ===\n")
+            self.run_stream(self.augment(
+                ["dnsx", "-l", infile, "-cname", "-resp", "-silent"], "dnsx"),
+                w, outfile=os.path.join(outdir, "takeover_cnames.txt"))
+        if self.tko_subzy.get() and self.has_tool("subzy"):
+            did = True
+            self.append(w, "\n=== subzy ===\n")
+            self.run_stream(["subzy", "run", "--targets", infile, "--hide_fails"], w)
+        elif self.tko_subzy.get():
+            self.append(w, "[*] subzy not installed (optional) — skipping.\n")
+        if self.tko_nuclei.get() and self.require(w, "nuclei"):
+            did = True
+            self.append(w, "\n=== nuclei takeover templates ===\n")
+            self.run_stream(self.augment(
+                ["nuclei", "-l", infile, "-tags", "takeover", "-silent"], "nuclei"),
+                w, outfile=os.path.join(outdir, "takeover_nuclei.txt"))
+        if did:
+            self.append(w, f"\n[+] Takeover checks done -> {outdir}\n")
+        self.update_status("Takeover check done.")
+
+    # ---- Params (arjun) ---- #
+    def start_params(self):
+        urls = [u for u in self._lines_from(self.params_input) if is_url(u)]
+        urls = self.scope_filter(urls, self.outputs["params"])
+        if not urls:
+            messagebox.showwarning("Input", "No valid in-scope URLs.")
+            return
+        self._launch(self.run_params, self.outputs["params"], (urls,))
+
+    def run_params(self, urls):
+        w = self.outputs["params"]
+        if not self.require(w, "arjun"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', urls[0]).split("/")[0])
+        infile = os.path.join(outdir, "arjun_urls.txt")
+        with open(infile, "w") as f:
+            f.write("\n".join(urls) + "\n")
+        out = os.path.join(outdir, "arjun_params.txt")
+        cmd = ["arjun", "-i", infile, "-oT", out,
+               "-m", self.params_method.get(),
+               "-t", str(max(1, self.params_threads.get()))]
+        if self.gopts["rate"]:
+            cmd += ["--rate-limit", str(self.gopts["rate"])]
+        if self._proxy_url():
+            self.append(w, "[*] Note: arjun has no proxy option; its traffic won't "
+                           "go through Burp.\n")
+        cmd = self.augment(cmd, "arjun")   # adds --headers
+        self.update_status(f"arjun on {len(urls)} URL(s) ...")
+        self.run_stream(cmd, w)
+        if os.path.isfile(out):
+            self.append(w, f"\n[+] Parameters saved -> {out}\n")
+        self.update_status("Param discovery done.")
+
+    # ---- Vhost fuzzing ---- #
+    def start_vhost(self):
+        target = self.vhost_target.get().strip()
+        target = re.sub(r'^https?://', '', target).split("/")[0]
+        domain = self.vhost_domain.get().strip().lstrip(".")
+        wl = self.vhost_wordlist.get().strip()
+        if not is_host(target):
+            messagebox.showwarning("Input", "Enter a valid target host or IP.")
+            return
+        if not is_domain(domain):
+            messagebox.showwarning("Input", "Enter a valid base domain (e.g. example.com).")
+            return
+        if not os.path.isfile(wl):
+            messagebox.showwarning("Wordlist", f"Wordlist not found:\n{wl}")
+            return
+        if not self.scope_filter([domain], self.outputs["vhost"]):
+            messagebox.showwarning("Scope", f"{domain} is out of scope.")
+            return
+        self._launch(self.run_vhost, self.outputs["vhost"], (target, domain, wl))
+
+    def run_vhost(self, target, domain, wl):
+        w = self.outputs["vhost"]
+        if not self.require(w, "ffuf"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(domain)
+        scheme = "https" if self.vhost_https.get() else "http"
+        out = os.path.join(outdir, f"vhosts_{sanitize_for_path(domain)}.json")
+        cmd = ["ffuf", "-u", f"{scheme}://{target}/", "-w", wl,
+               "-H", f"Host: FUZZ.{domain}", "-noninteractive", "-s",
+               "-o", out, "-of", "json", "-ac", "-mc", "all"]
+        rate = self.gopts["rate"]
+        if rate:
+            cmd += ["-rate", str(rate)]
+        if self._proxy_url():
+            cmd += ["-x", self._proxy_url()]
+        for h in self._all_headers():
+            cmd += ["-H", h]
+        self.update_status(f"Fuzzing vhosts on {target} for *.{domain} ...")
+        self.append(w, f"[*] ffuf Host: FUZZ.{domain} -> {scheme}://{target}/  "
+                       f"(auto-calibrated)\n")
+        # ffuf deadlocks if its stderr is merged into the stdout pipe -> keep split
+        self.run_stream(cmd, w, skip_blank=True, merge_stderr=False)
+        hits = self._parse_ffuf_file(out)
+        if hits:
+            self.append(w, f"\n[+] {len(hits)} candidate vhost(s):\n")
+            for label, code, size in hits:
+                self.append(w, f"  {label}.{domain}  -> [{code}] {size} B\n")
+            self.state["vhosts"] = [f"{lb}.{domain}" for lb, _, _ in hits]
+        else:
+            self.append(w, "\n[*] No vhosts stood out from the calibrated baseline.\n")
+        self.update_status(f"Vhost fuzzing done -> {out}")
+
+    @staticmethod
+    def _parse_ffuf_file(path):
+        """Read an ffuf JSON output file -> [(label, status, length)].
+        label is the FUZZ input value when present, else the matched URL."""
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        out = []
+        for r in data.get("results", []):
+            label = (r.get("input", {}) or {}).get("FUZZ") or r.get("url", "")
+            out.append((label, r.get("status", ""), r.get("length", "")))
+        return out
+
+    # ---- 403 bypass ---- #
+    BYPASS_PATHS = [
+        "{p}/", "{p}/.", "{p}//", "{p}/./", "{p}/%2e/", "{p}%20", "{p}%09",
+        "{p}?", "{p}#", "{p}/..;/", "{p};/", "{p}.json", "{p}.html", "{p}/~",
+        "/%2e{p}", "{p}..%2f", "{p}%2e%2e%2f",
+    ]
+    BYPASS_HEADERS = [
+        ("X-Forwarded-For", "127.0.0.1"), ("X-Forwarded-Host", "127.0.0.1"),
+        ("X-Originating-IP", "127.0.0.1"), ("X-Remote-IP", "127.0.0.1"),
+        ("X-Client-IP", "127.0.0.1"), ("X-Host", "127.0.0.1"),
+        ("X-Original-URL", "{path}"), ("X-Rewrite-URL", "{path}"),
+        ("X-Custom-IP-Authorization", "127.0.0.1"),
+    ]
+
+    def start_bypass(self):
+        urls = [u for u in self._lines_from(self.bypass_input) if is_url(u)]
+        urls = self.scope_filter(urls, self.outputs["bypass"])
+        if not urls:
+            messagebox.showwarning("Input", "No valid in-scope URLs.")
+            return
+        self._launch(self.run_bypass, self.outputs["bypass"], (urls,))
+
+    def run_bypass(self, urls):
+        w = self.outputs["bypass"]
+        if not self.require(w, "curl"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', urls[0]).split("/")[0])
+        results = []
+        for url in urls:
+            if self.stop_requested:
+                break
+            base = re.sub(r'^(https?://[^/]+)(/.*)?$', r'\1', url)
+            path = url[len(base):] or "/"
+            orig_code, orig_size = self._curl_probe(url)
+            self.append(w, f"\n=== {url}  (baseline [{orig_code}] {orig_size} B) ===\n")
+            wins = []
+            # path mutations
+            for tmpl in self.BYPASS_PATHS:
+                if self.stop_requested:
+                    break
+                mutated = base + tmpl.format(p=path)
+                code, size = self._curl_probe(mutated)
+                if code and code not in ("403", "401", orig_code) and code[0] in "23":
+                    wins.append((f"path {tmpl.format(p=path)}", code, size))
+                    self.append(w, f"  [BYPASS] {mutated}  -> [{code}] {size} B\n")
+            # header tricks
+            for name, val in self.BYPASS_HEADERS:
+                if self.stop_requested:
+                    break
+                hv = val.format(path=path)
+                code, size = self._curl_probe(url, extra_headers=[f"{name}: {hv}"])
+                if code and code not in ("403", "401", orig_code) and code[0] in "23":
+                    wins.append((f"header {name}: {hv}", code, size))
+                    self.append(w, f"  [BYPASS] {name}: {hv}  -> [{code}] {size} B\n")
+            # method change
+            for method in ("POST", "PUT", "TRACE", "OPTIONS"):
+                if self.stop_requested:
+                    break
+                code, size = self._curl_probe(url, method=method)
+                if code and code not in ("403", "401", orig_code) and code[0] in "23":
+                    wins.append((f"method {method}", code, size))
+                    self.append(w, f"  [BYPASS] method {method}  -> [{code}] {size} B\n")
+            if not wins:
+                self.append(w, "  no bypass found.\n")
+            results.append((url, orig_code, wins))
+        out = os.path.join(outdir, "bypass_403.txt")
+        with open(out, "w") as f:
+            for url, oc, wins in results:
+                f.write(f"{url} (baseline {oc})\n")
+                for desc, code, size in wins:
+                    f.write(f"  BYPASS {desc} -> {code} {size}B\n")
+        total = sum(len(wn) for _, _, wn in results)
+        self.append(w, f"\n[+] {total} bypass(es) across {len(urls)} URL(s) -> {out}\n")
+        self.update_status(f"403 bypass done: {total} hit(s).")
+
+    # ---- WPScan ---- #
+    def start_wpscan(self):
+        url = self.wpscan_url.get().strip()
+        if not url.startswith("http"):
+            url = "https://" + url
+        host = re.sub(r'^https?://', '', url).split("/")[0]
+        if not is_host(host):
+            messagebox.showwarning("Input", "Enter a valid WordPress URL.")
+            return
+        if not self.scope_filter([host], self.outputs["wpscan"]):
+            messagebox.showwarning("Scope", f"{host} is out of scope.")
+            return
+        self._launch(self.run_wpscan, self.outputs["wpscan"], (url,))
+
+    def run_wpscan(self, url):
+        w = self.outputs["wpscan"]
+        if not self.require(w, "wpscan"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', url).split("/")[0])
+        out = os.path.join(outdir, "wpscan.txt")
+        enum = "".join(c for c, v in self.wp_enum.items() if v.get())
+        cmd = ["wpscan", "--url", url, "--no-banner", "--disable-tls-checks",
+               "-f", "cli-no-color", "-o", out]
+        if enum:
+            cmd += ["-e", enum]
+        if self.wp_stealth.get():
+            cmd += ["--stealthy"]
+        if self.wp_token.get().strip():
+            cmd += ["--api-token", self.wp_token.get().strip()]
+        cmd = self.augment(cmd, "wpscan")
+        self.update_status(f"wpscan {url} ...")
+        self.run_stream(cmd, w)
+        self.append(w, f"\n[+] Saved -> {out}\n")
+        self.update_status("wpscan done.")
+
+    # ---- Nikto ---- #
+    def start_nikto(self):
+        targets = [t for t in self._lines_from(self.nikto_input)
+                   if is_host(re.sub(r'^https?://', '', t).split("/")[0])]
+        targets = self.scope_filter(targets, self.outputs["nikto"])
+        if not targets:
+            messagebox.showwarning("Input", "No valid in-scope hosts.")
+            return
+        self._launch(self.run_nikto, self.outputs["nikto"], (targets,))
+
+    def run_nikto(self, targets):
+        w = self.outputs["nikto"]
+        if not self.require(w, "nikto"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', targets[0]).split("/")[0])
+        for i, tgt in enumerate(targets, 1):
+            if self.stop_requested:
+                break
+            self.update_status(f"nikto {i}/{len(targets)}: {tgt}")
+            safe = sanitize_for_path(re.sub(r'^https?://', '', tgt))
+            out = os.path.join(outdir, f"nikto_{safe}.txt")
+            cmd = ["nikto", "-h", tgt, "-ask", "no", "-nointeractive",
+                   "-Format", "txt", "-output", out]
+            if self.nikto_ssl.get():
+                cmd += ["-ssl"]
+            if self.nikto_tuning.get().strip():
+                cmd += ["-Tuning", self.nikto_tuning.get().strip()]
+            if self._proxy_url():
+                cmd += ["-useproxy", self._proxy_url()]
+            for h in self._all_headers():
+                cmd += ["-Add-header", h]
+            self.append(w, f"\n=== nikto {tgt} ===\n")
+            self.run_stream(cmd, w)
+        self.append(w, f"\n[+] Nikto done -> {outdir}\n")
+        self.update_status("nikto done.")
 
 if __name__ == "__main__":
     root = tk.Tk()
