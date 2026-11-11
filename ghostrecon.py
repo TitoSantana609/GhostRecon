@@ -95,6 +95,143 @@ FFUF_DEFAULT_MC = "200-299,301,302,307,401,403,405,500"
 
 
 # --------------------------------------------------------------------------- #
+# Scope parsing (bug-bounty scope files: .txt / .csv / .json)
+# --------------------------------------------------------------------------- #
+# Asset-type / identifier hints that aren't web targets we can scan.
+NON_WEB_HINT = re.compile(
+    r'(play\.google|itunes\.apple|apps\.apple|GOOGLE_PLAY|APPLE_STORE|'
+    r'ANDROID|IOS|WINDOWS_APP|SOURCE_CODE|CIDR|SMART_CONTRACT|'
+    r'TESTFLIGHT|OTHER_?APK|HARDWARE|EXECUTABLE)', re.I)
+# App package IDs are reverse-DNS (com.example.app). Nobody names a real
+# subdomain "com"/"org"/"net", so a leading one of those with 3+ labels is a
+# package id, not a scannable host. (Kept deliberately narrow: "app", "io",
+# "dev", "me" etc. ARE common subdomains, so they're not treated as packages.)
+PACKAGE_PREFIX = {"com", "org", "net"}
+
+
+def host_from_identifier(value):
+    """Reduce a scope identifier to a scannable host/wildcard, or None.
+
+    'https://app.example.com/x' -> 'app.example.com'
+    '*.example.com'             -> '*.example.com'
+    'com.example.app' (pkg)     -> None (not a web host)
+    """
+    if not value:
+        return None
+    v = value.strip().strip('"').strip()
+    if not v or " " in v or NON_WEB_HINT.search(v):
+        return None
+    v = re.sub(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', '', v)   # strip scheme
+    v = v.split("/")[0].split("?")[0]                    # strip path/query
+    v = v.rsplit(":", 1)[0] if re.search(r':\d+$', v) else v  # strip :port
+    v = v.strip().rstrip(".").lower()
+    if v.startswith("*.") and is_domain(v[2:]):
+        return v
+    labels = v.split(".")
+    if len(labels) >= 3 and labels[0] in PACKAGE_PREFIX:
+        return None   # reverse-DNS package id (com.example.app), not a host
+    if is_host(v) and ("." in v):
+        return v
+    return None
+
+
+def scope_pattern(host):
+    """Compile a scope host/wildcard into a regex matching it and its subdomains."""
+    base = host[2:] if host.startswith("*.") else host
+    return re.compile(r'^(?:[A-Za-z0-9_-]+\.)*' + re.escape(base) + r'$', re.I)
+
+
+def _rows_from_json(data):
+    """Yield (identifier, eligible_bool_or_None) from assorted JSON scope shapes."""
+    if isinstance(data, dict):
+        # {"in_scope": [...], "out_of_scope": [...]} / include / exclude
+        for inc in ("in_scope", "include", "included", "targets", "scope"):
+            if isinstance(data.get(inc), list):
+                for x in data[inc]:
+                    yield from _rows_from_json(x) if isinstance(x, (dict, list)) \
+                        else [(x, True)]
+        for exc in ("out_of_scope", "exclude", "excluded", "out_scope"):
+            if isinstance(data.get(exc), list):
+                for x in data[exc]:
+                    yield from ((i, False) for i, _ in _rows_from_json(x)) \
+                        if isinstance(x, (dict, list)) else [(x, False)]
+        # HackerOne structured scope: {"data":[{"attributes":{...}}]}
+        if isinstance(data.get("data"), list):
+            for x in data["data"]:
+                yield from _rows_from_json(x)
+        if "attributes" in data and isinstance(data["attributes"], dict):
+            data = data["attributes"]
+        ident = next((data[k] for k in (
+            "asset_identifier", "identifier", "target", "url", "host",
+            "domain", "asset", "name") if data.get(k)), None)
+        if ident:
+            elig = data.get("eligible_for_submission", data.get("in_scope",
+                   data.get("eligible", True)))
+            yield (ident, bool(elig) if elig is not None else True)
+    elif isinstance(data, list):
+        for x in data:
+            yield from _rows_from_json(x)
+    elif isinstance(data, str):
+        yield (data, True)
+
+
+def parse_scope_file(path):
+    """Parse a .txt/.csv/.json scope file into a de-duplicated list of entries.
+
+    Returns list of dicts: {"raw", "host", "scope": "in"|"out"}.
+    Text rules: '#' comment; leading '!' or '-' marks out-of-scope.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    rows = []   # (raw_identifier, eligible_bool)
+    if ext == ".json":
+        with open(path, errors="replace") as f:
+            rows = list(_rows_from_json(json.load(f)))
+    elif ext == ".csv":
+        import csv
+        with open(path, newline="", errors="replace") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            has_header = csv.Sniffer().has_header(sample) if sample.strip() else False
+            reader = csv.reader(f)
+            header = [h.strip().lower() for h in next(reader, [])] if has_header else []
+            id_col = next((i for i, h in enumerate(header) if h in (
+                "identifier", "asset_identifier", "target", "url", "host",
+                "domain", "asset", "name")), 0)
+            elig_col = next((i for i, h in enumerate(header) if h in (
+                "eligible_for_submission", "in_scope", "eligible", "scope")), None)
+            if not has_header:
+                f.seek(0)
+                reader = csv.reader(f)
+            for parts in reader:
+                if not parts or not parts[id_col if id_col < len(parts) else 0].strip():
+                    continue
+                raw = parts[id_col if id_col < len(parts) else 0]
+                elig = True
+                if elig_col is not None and elig_col < len(parts):
+                    elig = str(parts[elig_col]).strip().lower() not in (
+                        "false", "no", "0", "out", "out_of_scope", "")
+                rows.append((raw, elig))
+    else:   # treat everything else as plain text
+        with open(path, errors="replace") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                out = ln[0] in "!-"
+                rows.append((ln.lstrip("!- ").strip(), not out))
+
+    entries, seen = [], set()
+    for raw, elig in rows:
+        host = host_from_identifier(raw)
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        entries.append({"raw": raw.strip(), "host": host,
+                        "scope": "in" if elig else "out"})
+    return entries
+
+
+# --------------------------------------------------------------------------- #
 # Directory busting: wordlists + throttle presets
 # --------------------------------------------------------------------------- #
 # dirb's own standard list.
@@ -200,6 +337,10 @@ class GhostReconGUI:
         # every tool. Loaded from disk so they persist across runs.
         self.gopts = dict(DEFAULT_SETTINGS)
         self._load_settings()
+
+        # Scope: parsed targets + compiled in/out patterns, and per-row checkboxes.
+        self.scope = {"entries": [], "in_pats": [], "out_pats": [], "file": None}
+        self._scope_checked = {}       # tree iid -> bool
 
         # Make sure go/pip user bin dirs are visible so freshly-installed tools resolve
         for p in ("~/go/bin", "~/.local/bin"):
@@ -464,7 +605,8 @@ class GhostReconGUI:
         self.notebook = ttk.Notebook(self.master)
         self.notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
-        self.outputs = {}  # tab name -> Text widget
+        self.outputs = {}  # tab name -> Text widget (order must match tab order)
+        self._build_scope_tab()
         self._build_subdomain_tab()
         self._build_livehost_tab()
         self._build_url_tab()
@@ -506,6 +648,217 @@ class GhostReconGUI:
         sb.grid(row=0, column=1, sticky="ns")
         text["yscrollcommand"] = sb.set
         return text
+
+    # --- Tab: Scope ------------------------------------------------------- #
+    STAGE_TARGETS = ["1. Subdomains", "2. Live Hosts", "3. URLs",
+                     "4. Ports", "5. Vulnerabilities", "6. Dir Busting"]
+
+    def _build_scope_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="Scope")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(3, weight=1)
+
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(2, weight=1)
+        btn = ttk.Button(top, text="Load scope file (.txt / .csv / .json)…",
+                         command=self._scope_load_file)
+        btn.grid(row=0, column=0, padx=(0, 8))
+        self.run_buttons.append(btn)
+        self.scope_enforce = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="Enforce scope (block out-of-scope targets everywhere)",
+                        variable=self.scope_enforce).grid(row=0, column=1, padx=4)
+        self.scope_label = ttk.Label(top, text="No scope loaded.", anchor="e")
+        self.scope_label.grid(row=0, column=2, sticky="e")
+
+        ctl = ttk.Frame(tab)
+        ctl.grid(row=1, column=0, sticky="ew", pady=(8, 2))
+        ttk.Button(ctl, text="Check all in-scope",
+                   command=lambda: self._scope_check_all(True)).pack(side="left")
+        ttk.Button(ctl, text="Uncheck all",
+                   command=lambda: self._scope_check_all(False)).pack(side="left", padx=4)
+        ttk.Button(ctl, text="Invert", command=self._scope_invert).pack(side="left")
+        ttk.Label(ctl, text="   Filter:").pack(side="left")
+        self.scope_search = tk.StringVar()
+        self.scope_search.trace_add("write", lambda *a: self._scope_populate())
+        ttk.Entry(ctl, textvariable=self.scope_search, width=22).pack(side="left", padx=4)
+
+        ttk.Label(tab, text="Tick the targets you want to test (out-of-scope rows are "
+                            "locked). Click the ✓ column to toggle.", foreground="#888"
+                  ).grid(row=2, column=0, sticky="w")
+
+        wrap = ttk.Frame(tab)
+        wrap.grid(row=3, column=0, sticky="nsew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        cols = ("sel", "scope", "host", "raw")
+        self.scope_tree = ttk.Treeview(wrap, columns=cols, show="headings",
+                                       selectmode="none")
+        for col, label, width, stretch in (("sel", "✓", 34, False),
+                                           ("scope", "Scope", 70, False),
+                                           ("host", "Host / target", 300, True),
+                                           ("raw", "Raw identifier", 320, True)):
+            self.scope_tree.heading(col, text=label)
+            self.scope_tree.column(col, width=width, stretch=stretch,
+                                   anchor="center" if col in ("sel", "scope") else "w")
+        self.scope_tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(wrap, command=self.scope_tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.scope_tree["yscrollcommand"] = sb.set
+        self.scope_tree.tag_configure("out", foreground="#c0392b")
+        self.scope_tree.bind("<Button-1>", self._scope_click)
+
+        send = ttk.Frame(tab)
+        send.grid(row=4, column=0, sticky="ew", pady=(6, 2))
+        ttk.Label(send, text="Send checked targets to:").pack(side="left")
+        self.scope_dest = ttk.Combobox(send, state="readonly", width=20,
+                                       values=self.STAGE_TARGETS)
+        self.scope_dest.set(self.STAGE_TARGETS[1])
+        self.scope_dest.pack(side="left", padx=4)
+        ttk.Button(send, text="Send", command=self._scope_send).pack(side="left")
+        self.scope_count = ttk.Label(send, text="")
+        self.scope_count.pack(side="left", padx=8)
+
+        log = ttk.Frame(tab)
+        log.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        log.columnconfigure(0, weight=1)
+        text = tk.Text(log, wrap=tk.WORD, state="disabled", height=4,
+                       font=("Courier New", 10), relief=tk.FLAT, bd=0)
+        text.grid(row=0, column=0, sticky="ew")
+        self.outputs["scope"] = text   # keep aligned with tab order (first tab)
+
+    def _scope_load_file(self):
+        path = filedialog.askopenfilename(
+            title="Load scope file",
+            filetypes=[("Scope files", "*.txt *.csv *.json *.lst"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            entries = parse_scope_file(path)
+        except Exception as e:
+            messagebox.showerror("Scope", f"Could not parse {os.path.basename(path)}:\n{e}")
+            return
+        self.scope["entries"] = entries
+        self.scope["file"] = path
+        self.scope["in_pats"] = [scope_pattern(e["host"]) for e in entries
+                                 if e["scope"] == "in"]
+        self.scope["out_pats"] = [scope_pattern(e["host"]) for e in entries
+                                  if e["scope"] == "out"]
+        self._scope_checked = {}
+        n_in = sum(1 for e in entries if e["scope"] == "in")
+        self.scope_label.config(text=f"{os.path.basename(path)} — {len(entries)} targets, "
+                                     f"{n_in} in-scope")
+        self.append(self.outputs["scope"],
+                    f"[+] Loaded {len(entries)} targets ({n_in} in-scope, "
+                    f"{len(entries) - n_in} out) from {path}\n")
+        self._scope_populate()
+        self.update_status(f"Scope loaded: {n_in} in-scope targets")
+
+    def _scope_populate(self):
+        tree = self.scope_tree
+        tree.delete(*tree.get_children())
+        needle = self.scope_search.get().strip().lower()
+        for i, e in enumerate(self.scope["entries"]):
+            if needle and needle not in e["host"].lower() and needle not in e["raw"].lower():
+                continue
+            iid = f"e{i}"
+            checked = self._scope_checked.get(iid, False)
+            mark = "☑" if checked else ("☐" if e["scope"] == "in" else "🔒")
+            tree.insert("", tk.END, iid=iid,
+                        values=(mark, e["scope"], e["host"], e["raw"]),
+                        tags=("out",) if e["scope"] == "out" else ())
+        self._scope_update_count()
+
+    def _scope_click(self, event):
+        if self.scope_tree.identify("region", event.x, event.y) != "cell":
+            return
+        iid = self.scope_tree.identify_row(event.y)
+        if not iid:
+            return
+        idx = int(iid[1:])
+        if self.scope["entries"][idx]["scope"] != "in":
+            return   # out-of-scope rows are locked
+        self._scope_checked[iid] = not self._scope_checked.get(iid, False)
+        self.scope_tree.set(iid, "sel", "☑" if self._scope_checked[iid] else "☐")
+        self._scope_update_count()
+
+    def _scope_check_all(self, value):
+        for i, e in enumerate(self.scope["entries"]):
+            if e["scope"] == "in":
+                self._scope_checked[f"e{i}"] = value
+        self._scope_populate()
+
+    def _scope_invert(self):
+        for i, e in enumerate(self.scope["entries"]):
+            if e["scope"] == "in":
+                iid = f"e{i}"
+                self._scope_checked[iid] = not self._scope_checked.get(iid, False)
+        self._scope_populate()
+
+    def _scope_update_count(self):
+        n = sum(1 for v in self._scope_checked.values() if v)
+        self.scope_count.config(text=f"{n} checked")
+
+    def scope_checked_hosts(self):
+        return [self.scope["entries"][int(iid[1:])]["host"]
+                for iid, on in self._scope_checked.items() if on]
+
+    def _scope_send(self):
+        hosts = self.scope_checked_hosts()
+        if not hosts:
+            messagebox.showinfo("Scope", "No targets checked.")
+            return
+        # strip wildcards for stages that want a concrete host/domain
+        plain = [h[2:] if h.startswith("*.") else h for h in hosts]
+        dest = self.scope_dest.get()
+        widget_map = {
+            "1. Subdomains": ("entry", "domain_entry"),
+            "2. Live Hosts": ("text", "hosts_input"),
+            "3. URLs": ("entry", "url_entry"),
+            "4. Ports": ("entry", "port_entry"),
+            "5. Vulnerabilities": ("text", "vuln_input"),
+            "6. Dir Busting": ("text", "dirbust_input"),
+        }
+        kind, attr = widget_map[dest]
+        widget = getattr(self, attr)
+        if kind == "text":
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", "\n".join(plain))
+            msg = f"{len(plain)} target(s)"
+        else:
+            widget.delete(0, tk.END)
+            widget.insert(0, plain[0])
+            msg = f"'{plain[0]}'" + (f" (+{len(plain) - 1} more ignored; "
+                                     "this stage takes one)" if len(plain) > 1 else "")
+        self.notebook.select(self.STAGE_TARGETS.index(dest) + 1)  # +1 past Scope tab
+        self.update_status(f"Sent {msg} to {dest}")
+
+    # Scope enforcement used by the active stages --------------------------- #
+    def in_scope(self, host):
+        """True if host is allowed: matches an in-scope pattern and no out pattern.
+        With no in-scope patterns loaded, everything is allowed."""
+        host = host.lower()
+        if not self.scope["in_pats"]:
+            return True
+        if any(p.match(host) for p in self.scope["out_pats"]):
+            return False
+        return any(p.match(host) for p in self.scope["in_pats"])
+
+    def scope_filter(self, hosts, widget):
+        """Drop out-of-scope hosts when enforcement is on; log what was blocked."""
+        if not (getattr(self, "scope_enforce", None) and self.scope_enforce.get()
+                and self.scope["in_pats"]):
+            return list(hosts)
+        kept, blocked = [], []
+        for h in hosts:
+            bare = re.sub(r'^https?://', '', h, flags=re.I).split("/")[0].split(":")[0]
+            (kept if self.in_scope(bare) else blocked).append(h)
+        if blocked:
+            self.append(widget, f"[scope] Blocked {len(blocked)} out-of-scope target(s): "
+                                f"{', '.join(blocked[:8])}{' …' if len(blocked) > 8 else ''}\n")
+        return kept
 
     # --- Tab: Subdomains -------------------------------------------------- #
     def _build_subdomain_tab(self):
@@ -1461,6 +1814,9 @@ class GhostReconGUI:
         if not is_domain(domain):
             messagebox.showwarning("Input", "Enter a valid domain, e.g. example.com")
             return
+        if not self.scope_filter([domain], self.outputs["sub"]):
+            messagebox.showwarning("Scope", f"{domain} is out of scope.")
+            return
         self._launch(self.run_subdomains, self.outputs["sub"], (domain,))
 
     def run_subdomains(self, domain):
@@ -1563,8 +1919,9 @@ class GhostReconGUI:
     def start_httpx(self):
         hosts = [h.strip() for h in self.hosts_input.get("1.0", tk.END).splitlines() if h.strip()]
         hosts = [h for h in hosts if is_host(h)]
+        hosts = self.scope_filter(hosts, self.outputs["live"])
         if not hosts:
-            messagebox.showwarning("Input", "Enter at least one valid host.")
+            messagebox.showwarning("Input", "No valid in-scope hosts to probe.")
             return
         self._launch(self.run_httpx, self.outputs["live"], (hosts,))
 
@@ -1610,6 +1967,9 @@ class GhostReconGUI:
         bare = re.sub(r'^https?://', '', target).split("/")[0]
         if not (is_url(target) and is_host(bare)):
             messagebox.showwarning("Input", "Enter a valid domain or URL.")
+            return
+        if not self.scope_filter([bare], self.outputs["url"]):
+            messagebox.showwarning("Scope", f"{bare} is out of scope.")
             return
         self._launch(self.run_url_recon, self.outputs["url"], (target, bare))
 
@@ -1670,6 +2030,9 @@ class GhostReconGUI:
         if not is_host(host):
             messagebox.showwarning("Input", "Enter a valid host or IP.")
             return
+        if not self.scope_filter([host], self.outputs["port"]):
+            messagebox.showwarning("Scope", f"{host} is out of scope.")
+            return
         self._launch(self.run_port_scan, self.outputs["port"], (host,))
 
     def run_port_scan(self, host):
@@ -1694,8 +2057,9 @@ class GhostReconGUI:
     def start_nuclei(self):
         targets = [t.strip() for t in self.vuln_input.get("1.0", tk.END).splitlines() if t.strip()]
         targets = [t for t in targets if is_host(re.sub(r'^https?://', '', t).split("/")[0])]
+        targets = self.scope_filter(targets, self.outputs["vuln"])
         if not targets:
-            messagebox.showwarning("Input", "Enter at least one valid target.")
+            messagebox.showwarning("Input", "No valid in-scope targets.")
             return
         self._launch(self.run_nuclei, self.outputs["vuln"], (targets,))
 
@@ -1730,8 +2094,9 @@ class GhostReconGUI:
             host = re.sub(r'^https?://', '', url, flags=re.I).split("/")[0].split(":")[0]
             if is_url(url) and is_host(host):
                 targets.append(url.rstrip("/"))
+        targets = self.scope_filter(targets, self.outputs["dir"])
         if not targets:
-            messagebox.showwarning("Input", "Enter at least one valid URL or host.")
+            messagebox.showwarning("Input", "No valid in-scope URL/host to bust.")
             return
         use_dirb, use_ffuf = self.db_use_dirb.get(), self.db_use_ffuf.get()
         if not (use_dirb or use_ffuf):
