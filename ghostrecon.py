@@ -352,6 +352,11 @@ DEFAULT_SETTINGS = {
     "bb_on": False, "bb_header": "X-Bug-Bounty", "bb_value": "",
     "rate": 0,            # global requests/sec cap (0 = unlimited)
     "browser_ua": False,  # send a real-browser User-Agent everywhere
+    # Out-of-band / OAST testing
+    "oob_server": "",     # self-hosted interactsh server (nuclei -iserver)
+    "oob_token": "",      # interactsh auth token (nuclei -itoken)
+    "oob_host": "",       # a callback host/payload domain for manual use / Collaborator
+    "oob_disable": False, # disable OAST entirely (nuclei -ni) when a program forbids it
 }
 
 
@@ -519,6 +524,17 @@ class GhostReconGUI:
                 cmd += [flag, "\n".join(headers)]
         return cmd
 
+    def nuclei_oob_args(self):
+        """nuclei interactsh/OAST flags for the configured callback server."""
+        if self.gopts["oob_disable"]:
+            return ["-ni"]            # no-interactsh: skip OAST templates entirely
+        args = []
+        if self.gopts["oob_server"].strip():
+            args += ["-iserver", self.gopts["oob_server"].strip()]
+            if self.gopts["oob_token"].strip():
+                args += ["-itoken", self.gopts["oob_token"].strip()]
+        return args
+
     def proxy_summary(self):
         p = self._proxy_url()
         bits = []
@@ -528,12 +544,16 @@ class GhostReconGUI:
             bits.append(f"{len(self._all_headers())} header(s)")
         if self.gopts["rate"]:
             bits.append(f"{self.gopts['rate']} req/s")
+        if self.gopts["oob_disable"]:
+            bits.append("OAST off")
+        elif self.gopts["oob_server"].strip():
+            bits.append(f"OAST {self.gopts['oob_server'].strip()}")
         return " · ".join(bits) if bits else "no global options set"
 
     def open_global_settings(self):
         win = tk.Toplevel(self.master)
         win.title("Global request settings")
-        win.geometry("640x620")
+        win.geometry("660x780")
         t = THEMES[self.theme_name]
         win.configure(bg=t["bg"])
         frm = ttk.Frame(win, padding=14)
@@ -608,6 +628,43 @@ class GhostReconGUI:
                   ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
         row += 1
 
+        section("Out-of-band / OAST (interactsh · Collaborator)")
+        ttk.Label(frm, text="interactsh server:").grid(row=row, column=0, sticky="w")
+        oob_server = tk.StringVar(value=g["oob_server"])
+        ttk.Entry(frm, textvariable=oob_server).grid(row=row, column=1, columnspan=2,
+                                                     sticky="ew", padx=4)
+        row += 1
+        ttk.Label(frm, text="interactsh token:").grid(row=row, column=0, sticky="w")
+        oob_token = tk.StringVar(value=g["oob_token"])
+        ttk.Entry(frm, textvariable=oob_token, show="*").grid(row=row, column=1,
+                                                             columnspan=2, sticky="ew", padx=4)
+        row += 1
+        ttk.Label(frm, text="Callback host:").grid(row=row, column=0, sticky="w")
+        hostframe = ttk.Frame(frm)
+        hostframe.grid(row=row, column=1, columnspan=2, sticky="ew", padx=4)
+        hostframe.columnconfigure(0, weight=1)
+        oob_host = tk.StringVar(value=g["oob_host"])
+        ttk.Entry(hostframe, textvariable=oob_host).grid(row=0, column=0, sticky="ew")
+
+        def copy_host():
+            h = oob_host.get().strip()
+            if h:
+                self.master.clipboard_clear()
+                self.master.clipboard_append(h)
+                self.update_status(f"Copied callback host: {h}")
+        ttk.Button(hostframe, text="Copy", command=copy_host).grid(row=0, column=1, padx=(4, 0))
+        row += 1
+        oob_disable = tk.BooleanVar(value=g["oob_disable"])
+        ttk.Checkbutton(frm, text="Disable OAST entirely (nuclei -ni) — for programs that "
+                                 "forbid out-of-band testing", variable=oob_disable
+                        ).grid(row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+        ttk.Label(frm, text="Server + token drive nuclei's interactsh (-iserver/-itoken). "
+                            "The callback host is\nyours to paste into manual payloads / "
+                            "Burp Collaborator (use Copy).", foreground=t["tab_fg"]
+                  ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+
         btns = ttk.Frame(frm)
         btns.grid(row=row, column=0, columnspan=3, sticky="e", pady=(8, 0))
 
@@ -626,6 +683,8 @@ class GhostReconGUI:
                 "bb_on": bb_on.get(), "bb_header": bb_header.get().strip() or "X-Bug-Bounty",
                 "bb_value": bb_value.get().strip(),
                 "rate": max(0, rate_val), "browser_ua": browser_ua.get(),
+                "oob_server": oob_server.get().strip(), "oob_token": oob_token.get().strip(),
+                "oob_host": oob_host.get().strip(), "oob_disable": oob_disable.get(),
             })
             self._save_settings()
             self.update_status(f"Global settings saved — {self.proxy_summary()}")
@@ -2185,6 +2244,10 @@ class GhostReconGUI:
         sev = self.severity.get().strip()
         if sev:
             cmd += ["-severity", sev]
+        oob = self.nuclei_oob_args()
+        if oob:
+            cmd += oob
+            self.append(w, f"[*] OAST: {' '.join(oob)}\n")
         self.update_status(f"Running nuclei on {len(targets)} targets ...")
         self.run_stream(self.augment(cmd, "nuclei"), w)
         self.append(w, f"\n[+] Saved to {out}\n")
