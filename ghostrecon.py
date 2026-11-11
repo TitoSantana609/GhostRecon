@@ -2758,6 +2758,13 @@ class GhostReconGUI:
         self.api_assetnote.grid(row=1, column=1, sticky="w", padx=4)
         ttk.Label(wl, text="e.g. apiroutes-210328 (auto-downloads; overrides file if set)",
                   foreground="#888").grid(row=1, column=2, sticky="w")
+        dlbtn = ttk.Button(wl, text="Download kite wordlists…",
+                           command=self.start_kite_download)
+        dlbtn.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.run_buttons.append(dlbtn)
+        ttk.Label(wl, text="routes-small (~0.4 MB) + optional routes-large (~36 MB) "
+                          "from Assetnote", foreground="#888"
+                  ).grid(row=2, column=2, sticky="w")
 
         opt = ttk.Frame(tab)
         opt.grid(row=4, column=0, columnspan=4, sticky="w", padx=4, pady=2)
@@ -2774,10 +2781,17 @@ class GhostReconGUI:
         self.run_buttons.append(btn)
         self.outputs["api"] = self._make_output(tab)
 
+    KITE_DIR = os.path.expanduser("~/.cache/kiterunner")
+    KITE_CDN = "https://wordlists-cdn.assetnote.io/data/kiterunner/"
+
     @staticmethod
     def best_api_wordlist():
         import glob as _glob
-        kites = _glob.glob(os.path.expanduser("~/.cache/kiterunner/*.kite")) \
+        # routes-small is the sensible default (fast, broad); then any other .kite
+        small = os.path.join(GhostReconGUI.KITE_DIR, "routes-small.kite")
+        if os.path.isfile(small):
+            return small
+        kites = _glob.glob(os.path.join(GhostReconGUI.KITE_DIR, "*.kite")) \
             + _glob.glob(os.path.expanduser("~/*.kite")) \
             + _glob.glob("/usr/share/wordlists/**/*.kite", recursive=True)
         if kites:
@@ -3165,6 +3179,56 @@ class GhostReconGUI:
             label = (r.get("input", {}) or {}).get("FUZZ") or r.get("url", "")
             out.append((label, r.get("status", ""), r.get("length", "")))
         return out
+
+    # ---- kite wordlist download ---- #
+    def start_kite_download(self):
+        big = messagebox.askyesno(
+            "Download kite wordlists",
+            "Download routes-small.kite (~0.4 MB) now.\n\n"
+            "Also download routes-large.kite (~36 MB download, ~190 MB on disk)?")
+        self._launch(self.download_kite_wordlists, self.outputs["api"], (big,))
+
+    def download_kite_wordlists(self, include_large):
+        import tarfile
+        w = self.outputs["api"]
+        if not self.require(w, "curl"):
+            return
+        os.makedirs(self.KITE_DIR, exist_ok=True)
+        wanted = ["routes-small.kite.tar.gz"]
+        if include_large:
+            wanted.append("routes-large.kite.tar.gz")
+        for arc in wanted:
+            if self.stop_requested:
+                break
+            dest = os.path.join(self.KITE_DIR, arc)
+            kite = arc[:-len(".tar.gz")]
+            self.append(w, f"[*] Downloading {arc} ...\n")
+            self.update_status(f"Downloading {arc} ...")
+            self.run_stream(["curl", "-fL", "--progress-bar", "-o", dest,
+                             self.KITE_CDN + arc], w, merge_stderr=True)
+            if not os.path.isfile(dest) or os.path.getsize(dest) == 0:
+                self.append(w, f"[!] Download of {arc} failed.\n")
+                continue
+            try:
+                with tarfile.open(dest) as tf:
+                    member = next((m for m in tf.getmembers()
+                                   if m.name.endswith(".kite")), None)
+                    if member:
+                        member.name = os.path.basename(member.name)  # flatten
+                        tf.extract(member, self.KITE_DIR)
+                os.remove(dest)   # drop the archive once extracted
+            except (tarfile.TarError, OSError) as e:
+                self.append(w, f"[!] Could not extract {arc}: {e}\n")
+                continue
+            kpath = os.path.join(self.KITE_DIR, kite)
+            if os.path.isfile(kpath):
+                size = os.path.getsize(kpath) // (1024 * 1024)
+                self.append(w, f"[+] {kite} ready ({size} MB) -> {kpath}\n")
+        small = os.path.join(self.KITE_DIR, "routes-small.kite")
+        if os.path.isfile(small):
+            self.master.after(0, lambda: self.api_wordlist.set(small))
+            self.append(w, f"[*] Wordlist set to {small}\n")
+        self.update_status("kite wordlists ready.")
 
     # ---- API routes (kiterunner) ---- #
     def start_kiterunner(self):
