@@ -27,6 +27,8 @@ import queue
 import random
 import string
 import time
+import shlex
+from urllib.parse import urlsplit, parse_qsl, quote
 
 try:
     import pyfiglet
@@ -361,6 +363,7 @@ PROXY_FLAG = {
     "httpx": "-http-proxy", "katana": "-proxy", "nuclei": "-proxy",
     "dnsx": "-proxy", "naabu": "-proxy", "ffuf": "-x",
     "wpscan": "--proxy", "nikto": "-useproxy", "kr": "--proxy",
+    "sqlmap": "--proxy", "dalfox": "--proxy",
 }
 # Requests/sec cap per tool (0/unset = no cap). ffuf/dirb carry their own in the
 # Dir Busting tab, so they're injected there, not globally.
@@ -378,6 +381,7 @@ HEADER_STYLE = {
     "dirb": ("-H", "repeat"), "nikto": ("-Add-header", "repeat"),
     "wpscan": ("--headers", "join"), "arjun": ("--headers", "nl"),
     "kr": ("-H", "repeat"),
+    "sqlmap": ("-H", "repeat"), "dalfox": ("-H", "repeat"),
 }
 DEFAULT_SETTINGS = {
     "proxy_on": False, "proxy_url": "http://127.0.0.1:8080",
@@ -390,6 +394,8 @@ DEFAULT_SETTINGS = {
     "oob_token": "",      # interactsh auth token (nuclei -itoken)
     "oob_host": "",       # a callback host/payload domain for manual use / Collaborator
     "oob_disable": False, # disable OAST entirely (nuclei -ni) when a program forbids it
+    # Active Testing: LFImap must never reach out-of-band unless explicitly allowed
+    "lfi_allow_callbacks": False,  # permit LFImap RFI / reverse-shell / --callback vectors
 }
 
 
@@ -692,6 +698,17 @@ class GhostReconGUI:
                                  "forbid out-of-band testing", variable=oob_disable
                         ).grid(row=row, column=0, columnspan=3, sticky="w")
         row += 1
+        lfi_cb = tk.BooleanVar(value=g["lfi_allow_callbacks"])
+        ttk.Checkbutton(frm, text="Allow LFImap external callbacks (RFI / reverse shell / "
+                                 "--callback) in Active Testing", variable=lfi_cb
+                        ).grid(row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+        ttk.Label(frm, text="Off by default: LFImap runs only local-inclusion techniques and "
+                            "never reaches out-of-band.\nTurn on only when a program permits it; "
+                            "set the Callback host above for the payload target.",
+                  foreground=t["tab_fg"]).grid(row=row, column=0, columnspan=3,
+                                               sticky="w", pady=(0, 6))
+        row += 1
         ttk.Label(frm, text="Server + token drive nuclei's interactsh (-iserver/-itoken). "
                             "The callback host is\nyours to paste into manual payloads / "
                             "Burp Collaborator (use Copy).", foreground=t["tab_fg"]
@@ -718,8 +735,10 @@ class GhostReconGUI:
                 "rate": max(0, rate_val), "browser_ua": browser_ua.get(),
                 "oob_server": oob_server.get().strip(), "oob_token": oob_token.get().strip(),
                 "oob_host": oob_host.get().strip(), "oob_disable": oob_disable.get(),
+                "lfi_allow_callbacks": lfi_cb.get(),
             })
             self._save_settings()
+            self._refresh_lfi_callback_ui()
             self.update_status(f"Global settings saved — {self.proxy_summary()}")
             win.destroy()
 
@@ -771,6 +790,7 @@ class GhostReconGUI:
         self._build_dirbust_tab()
         self._build_reconplus_tab()
         self._build_webscan_tab()
+        self._build_active_tab()
 
         # Bottom control/status bar
         bottom = ttk.Frame(self.master, padding=(8, 4))
@@ -1682,6 +1702,9 @@ class GhostReconGUI:
         "nikto": "https://github.com/sullo/nikto",
         "js-beautify": "https://github.com/beautifier/js-beautify",
         "kr": "https://github.com/assetnote/kiterunner",
+        "sqlmap": "https://github.com/sqlmapproject/sqlmap",
+        "lfimap": "https://github.com/hansmach1ne/LFImap",
+        "dalfox": "https://github.com/hahwul/dalfox",
     }
 
     # How to install each tool. "go"/"pip" entries run without sudo; "apt" needs sudo.
@@ -1709,6 +1732,9 @@ class GhostReconGUI:
         "nikto":     ("apt", "sudo apt-get install -y nikto"),
         "js-beautify": ("pip", "pip3 install --user jsbeautifier"),
         "kr":        ("go", "go install github.com/assetnote/kiterunner/cmd/kr@latest"),
+        "sqlmap":    ("apt", "sudo apt-get install -y sqlmap"),
+        "lfimap":    ("pip", "pipx install lfimap 2>/dev/null || pip3 install --user lfimap"),
+        "dalfox":    ("go", "go install github.com/hahwul/dalfox/v2@latest"),
     }
     # Tools that are optional enhancers: never block a stage, just improve it.
     OPTIONAL_TOOLS = {"jsluice", "subzy", "x8", "js-beautify", "kr"}
@@ -3500,6 +3526,719 @@ class GhostReconGUI:
             self.run_stream(cmd, w)
         self.append(w, f"\n[+] Nikto done -> {outdir}\n")
         self.update_status("nikto done.")
+
+    # ================================================================== #
+    # Active Testing tab (SQLMap · LFImap · Dalfox)
+    # ================================================================== #
+    # Parameter names that frequently carry SQL injection.
+    SQL_PARAM_HINTS = {
+        "id", "uid", "pid", "cid", "sid", "eid", "gid", "tid", "itemid", "item",
+        "productid", "product", "cat", "category", "catid", "page", "pageid", "p",
+        "news", "newsid", "article", "articleid", "sort", "order", "orderby",
+        "sortby", "user", "userid", "username", "account", "number", "no", "num",
+        "year", "month", "day", "view", "query", "q", "search", "keyword", "key",
+        "s", "ref", "lang", "report", "sel", "select", "type", "mode", "action",
+        "do", "func", "option", "group", "filter", "from", "to", "start", "limit",
+        "offset", "email", "name", "title", "code", "token", "file",
+    }
+
+    # Passive/active WAF fingerprints -> (name, [lowercase needles in headers+body]).
+    WAF_SIGNATURES = [
+        ("Cloudflare", ["cf-ray", "cloudflare", "__cfduid", "cf_clearance",
+                        "cf-cache-status", "cf-mitigated"]),
+        ("Imperva/Incapsula", ["incap_ses", "visid_incap", "x-iinfo",
+                               "incapsula", "x-cdn: incapsula"]),
+        ("Akamai", ["akamaighost", "x-akamai", "akamai"]),
+        ("Sucuri", ["x-sucuri", "sucuri/cloudproxy", "sucuri"]),
+        ("F5 BIG-IP ASM", ["bigipserver", "x-waf-event", "big-ip", "bigip"]),
+        ("AWS WAF", ["x-amzn-waf", "awselb", "x-amz-cf-id", "x-amzn-requestid"]),
+        ("ModSecurity", ["mod_security", "modsecurity", "libmodsecurity",
+                         "this error was generated by mod_security"]),
+        ("Barracuda", ["barra_counter_session", "barracuda"]),
+        ("FortiWeb", ["fortiwafsid", "fortiweb", "fortigate"]),
+        ("DDoS-Guard", ["ddos-guard", "__ddg"]),
+        ("StackPath", ["stackpath"]),
+        ("Wordfence", ["wordfence", "generated by wordfence"]),
+        ("Reblaze", ["rbzid", "reblaze"]),
+    ]
+    # sqlmap --tamper chains tuned per WAF (all are real tamper scripts).
+    WAF_TAMPER = {
+        "Cloudflare": "space2comment,charencode,randomcase",
+        "Imperva/Incapsula": "space2comment,between,percentage,randomcase",
+        "Akamai": "space2randomblank,randomcase,charencode",
+        "Sucuri": "space2comment,randomcase,charencode",
+        "F5 BIG-IP ASM": "space2hash,randomcase,charencode",
+        "AWS WAF": "charencode,space2comment,randomcase",
+        "ModSecurity": "between,randomcase,space2comment,modsecurityversioned",
+        "Barracuda": "space2hash,randomcase",
+        "FortiWeb": "space2comment,randomcase,charencode",
+        "DDoS-Guard": "space2comment,randomcase",
+        "StackPath": "space2comment,charencode,randomcase",
+        "Wordfence": "space2comment,randomcase",
+        "Reblaze": "space2comment,charencode,randomcase",
+        "Generic/Unknown WAF": "between,space2comment,randomcase",
+    }
+    # LFImap local-only techniques: code -> (flag, label, default-on). None of
+    # these reach out-of-band; the callback vectors live in a separate, gated set.
+    LFI_LOCAL_TECHNIQUES = {
+        "heur":   ("-heur", "Heuristics", True),
+        "filter": ("-f", "PHP filter", True),
+        "input":  ("-i", "php://input", True),
+        "data":   ("-d", "data://", True),
+        "expect": ("-e", "expect://", False),
+        "file":   ("-file", "file://", True),
+        "trunc":  ("-t", "Truncation", False),
+        "cmd":    ("-c", "Cmd polyglot", True),
+    }
+
+    def _build_active_tab(self):
+        outer = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(outer, text="9. Active Testing")
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        inner = ttk.Notebook(outer)
+        inner.grid(row=0, column=0, sticky="nsew")
+        self._build_sqlmap_subtab(inner)
+        self._build_lfimap_subtab(inner)
+        self._build_dalfox_subtab(inner)
+
+    def _choose_file(self, var, filetypes, title="Choose a file"):
+        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if path:
+            var.set(path)
+
+    def _active_scope_ok(self, host, w):
+        if not host:
+            return True
+        return bool(self.scope_filter([host], w))
+
+    # ---- shared analysis helpers ---- #
+    def _http_capture(self, url, timeout=12):
+        """Return (status_code, headers+body lowercased) for a single request,
+        honouring the global proxy/headers. ('', '') on error."""
+        cmd = ["curl", "-s", "-k", "-i", "--max-time", str(timeout)]
+        if self._proxy_url():
+            cmd += ["-x", self._proxy_url()]
+        for h in self._all_headers():
+            cmd += ["-H", h]
+        cmd.append(url)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 3)
+        except (subprocess.SubprocessError, OSError):
+            return "", ""
+        blob = r.stdout
+        m = re.search(r'HTTP/\d(?:\.\d)?\s+(\d{3})', blob)
+        return (m.group(1) if m else ""), blob.lower()
+
+    def _match_waf(self, blob):
+        if not blob:
+            return None
+        for name, needles in self.WAF_SIGNATURES:
+            if any(n in blob for n in needles):
+                return name
+        return None
+
+    def _waf_detect(self, url, w):
+        """Fingerprint a WAF passively, then actively with a hostile probe."""
+        self.append(w, "[*] WAF detection ...\n")
+        b_status, b_blob = self._http_capture(url)
+        name = self._match_waf(b_blob)
+        if name:
+            self.append(w, f"    [waf] passive signature -> {name}\n")
+            return name
+        sep = "&" if "?" in url else "?"
+        payload = quote("1' OR '1'='1 UNION SELECT NULL-- -"
+                        "<script>alert(1)</script>../../../etc/passwd")
+        m_status, m_blob = self._http_capture(url + sep + "gr_probe=" + payload)
+        name = self._match_waf(m_blob)
+        if name:
+            self.append(w, f"    [waf] active signature -> {name}\n")
+            return name
+        block = {"403", "406", "429", "501", "419", "494", "999", "503", "418"}
+        if m_status in block and b_status not in block:
+            self.append(w, f"    [waf] hostile probe blocked ({m_status}, baseline "
+                           f"{b_status or '?'}) -> Generic/Unknown WAF\n")
+            return "Generic/Unknown WAF"
+        self.append(w, "    [waf] none detected.\n")
+        return None
+
+    def _extract_params(self, url, data=""):
+        """List (name, value, where) for query-string and body parameters."""
+        out = []
+        try:
+            q = urlsplit(url if url.startswith("http") else "http://" + url).query
+        except Exception:
+            q = ""
+        out += [(k, v, "GET") for k, v in parse_qsl(q, keep_blank_values=True)]
+        dt = (data or "").strip()
+        if dt.startswith("{"):
+            try:
+                for k, v in json.loads(dt).items():
+                    out.append((k, str(v), "JSON"))
+            except Exception:
+                pass
+        elif dt:
+            out += [(k, v, "POST") for k, v in parse_qsl(dt, keep_blank_values=True)]
+        return out
+
+    def _likely_sql_params(self, params):
+        """Rank parameters that look injectable (known name, numeric, or id-ish)."""
+        res, seen = [], set()
+        for name, val, _where in params:
+            lname = name.lower()
+            hit = (lname in self.SQL_PARAM_HINTS
+                   or bool(re.fullmatch(r'-?\d+', (val or "").strip()))
+                   or bool(re.search(r'(id|cat|user|order|sort|page|item|'
+                                     r'num|key|name|search|query)', lname)))
+            if hit and name not in seen:
+                seen.add(name)
+                res.append(name)
+        return res
+
+    def _parse_request_file(self, path):
+        """Best-effort parse of a raw HTTP request file (Burp 'Save item')."""
+        try:
+            raw = open(path, "r", errors="replace").read()
+        except OSError:
+            return None
+        lines = raw.splitlines()
+        if not lines:
+            return None
+        m = re.match(r'([A-Z]+)\s+(\S+)\s+HTTP', lines[0])
+        if not m:
+            return None
+        method, target = m.group(1), m.group(2)
+        headers, body_idx = {}, None
+        for i in range(1, len(lines)):
+            if lines[i] == "":
+                body_idx = i + 1
+                break
+            if ":" in lines[i]:
+                hk, _, hv = lines[i].partition(":")
+                headers[hk.strip().lower()] = hv.strip()
+        host = headers.get("host", "")
+        data = "\n".join(lines[body_idx:]).strip() if body_idx else ""
+        if target.startswith("http"):
+            url = target
+        else:
+            scheme = "http" if ":80" in host else "https"
+            url = f"{scheme}://{host}{target}"
+        return {"method": method, "url": url, "data": data,
+                "host": host.split(":")[0]}
+
+    # ---- SQLMap ---- #
+    def _build_sqlmap_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="SQLMap")
+        tab.columnconfigure(1, weight=1)
+        ttk.Label(tab, text="Target URL (include params for GET, e.g. "
+                            "https://site/view?id=1):").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0))
+        self.sqlmap_url = ttk.Entry(tab)
+        self.sqlmap_url.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        mrow = ttk.Frame(tab)
+        mrow.grid(row=2, column=0, columnspan=3, sticky="ew", padx=4)
+        ttk.Label(mrow, text="Method:").pack(side="left")
+        self.sqlmap_method = ttk.Combobox(mrow, state="readonly", width=6,
+                                          values=["GET", "POST"])
+        self.sqlmap_method.set("GET")
+        self.sqlmap_method.pack(side="left", padx=4)
+        ttk.Label(mrow, text="POST data / JSON body:").pack(side="left", padx=(8, 2))
+        self.sqlmap_data = ttk.Entry(mrow)
+        self.sqlmap_data.pack(side="left", fill="x", expand=True)
+        frow = ttk.LabelFrame(tab, text="…or load from file", padding=6)
+        frow.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        frow.columnconfigure(1, weight=1)
+        ttk.Label(frow, text="Request file (-r):").grid(row=0, column=0, sticky="w")
+        self.sqlmap_reqfile = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.sqlmap_reqfile).grid(row=0, column=1,
+                                                               sticky="ew", padx=4)
+        ttk.Button(frow, text="Browse…", command=lambda: self._choose_file(
+            self.sqlmap_reqfile, [("HTTP request", "*.txt *.req *.http"),
+                                  ("All files", "*")],
+            "Choose a saved HTTP request")).grid(row=0, column=2)
+        ttk.Label(frow, text="Bulk URL file (-m):").grid(row=1, column=0, sticky="w")
+        self.sqlmap_bulk = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.sqlmap_bulk).grid(row=1, column=1,
+                                                            sticky="ew", padx=4)
+        ttk.Button(frow, text="Browse…", command=lambda: self._choose_file(
+            self.sqlmap_bulk, [("URL list", "*.txt"), ("All files", "*")],
+            "Choose a URL list")).grid(row=1, column=2)
+        o1 = ttk.Frame(tab)
+        o1.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        ttk.Label(o1, text="Level:").pack(side="left")
+        self.sqlmap_level = tk.IntVar(value=1)
+        ttk.Spinbox(o1, from_=1, to=5, width=4,
+                    textvariable=self.sqlmap_level).pack(side="left", padx=4)
+        ttk.Label(o1, text="Risk:").pack(side="left")
+        self.sqlmap_risk = tk.IntVar(value=1)
+        ttk.Spinbox(o1, from_=1, to=3, width=4,
+                    textvariable=self.sqlmap_risk).pack(side="left", padx=4)
+        self.sqlmap_autoparam = tk.BooleanVar(value=True)
+        ttk.Checkbutton(o1, text="Auto-detect & target likely params (-p)",
+                        variable=self.sqlmap_autoparam).pack(side="left", padx=6)
+        self.sqlmap_waf = tk.BooleanVar(value=True)
+        ttk.Checkbutton(o1, text="WAF detect + adapt tamper",
+                        variable=self.sqlmap_waf).pack(side="left")
+        o2 = ttk.Frame(tab)
+        o2.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        self.sqlmap_dbs = tk.BooleanVar(value=True)
+        self.sqlmap_banner = tk.BooleanVar(value=True)
+        self.sqlmap_curuser = tk.BooleanVar(value=False)
+        self.sqlmap_randagent = tk.BooleanVar(value=True)
+        ttk.Checkbutton(o2, text="--dbs", variable=self.sqlmap_dbs).pack(side="left")
+        ttk.Checkbutton(o2, text="--banner",
+                        variable=self.sqlmap_banner).pack(side="left", padx=6)
+        ttk.Checkbutton(o2, text="--current-user",
+                        variable=self.sqlmap_curuser).pack(side="left")
+        ttk.Checkbutton(o2, text="--random-agent",
+                        variable=self.sqlmap_randagent).pack(side="left", padx=6)
+        o3 = ttk.Frame(tab)
+        o3.grid(row=6, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        ttk.Label(o3, text="Extra args:").pack(side="left")
+        self.sqlmap_extra = ttk.Entry(o3)
+        self.sqlmap_extra.pack(side="left", fill="x", expand=True, padx=4)
+        btn = ttk.Button(tab, text="Run SQLMap", command=self.start_sqlmap)
+        btn.grid(row=7, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["sqlmap"] = self._make_output(tab)
+
+    def start_sqlmap(self):
+        reqfile = self.sqlmap_reqfile.get().strip()
+        bulk = self.sqlmap_bulk.get().strip()
+        url = self.sqlmap_url.get().strip()
+        if not (reqfile or bulk or url):
+            messagebox.showwarning("Input", "Provide a URL, a request file, or a bulk URL file.")
+            return
+        if reqfile and not os.path.isfile(reqfile):
+            messagebox.showwarning("Input", "Request file not found.")
+            return
+        if bulk and not os.path.isfile(bulk):
+            messagebox.showwarning("Input", "Bulk URL file not found.")
+            return
+        if url and not reqfile and not bulk and not is_url(url):
+            messagebox.showwarning("Input", "Enter a valid target URL.")
+            return
+        self._launch(self.run_sqlmap, self.outputs["sqlmap"], ())
+
+    def run_sqlmap(self):
+        w = self.outputs["sqlmap"]
+        if not self.require(w, "sqlmap"):
+            return
+        reqfile = self.sqlmap_reqfile.get().strip()
+        bulk = self.sqlmap_bulk.get().strip()
+        url = self.sqlmap_url.get().strip()
+        data = self.sqlmap_data.get().strip()
+        method = self.sqlmap_method.get()
+        # Resolve an absolute URL + body for pre-analysis (params, WAF).
+        an_url, an_data, host = "", data, ""
+        if url:
+            an_url = url if url.startswith("http") else "http://" + url
+            host = urlsplit(an_url).hostname or ""
+        elif reqfile:
+            parsed = self._parse_request_file(reqfile)
+            if parsed:
+                an_url, an_data, host = parsed["url"], parsed["data"], parsed["host"]
+        if host and not self._active_scope_ok(host, w):
+            self.append(w, f"[scope] {host} is out of scope — aborting.\n")
+            return
+        outdir = self.state["outdir"] or self._new_outdir(host or "sqlmap")
+        cmd = ["sqlmap", "--batch", "--disable-coloring"]
+        if reqfile:
+            cmd += ["-r", reqfile]
+        elif bulk:
+            cmd += ["-m", bulk]
+        else:
+            cmd += ["-u", an_url]
+            if data:
+                cmd += ["--data", data]
+            elif method == "POST":
+                self.append(w, "[!] POST selected but no data given; sqlmap will test as GET.\n")
+        # Automatic SQL-parameter detection -> focus sqlmap with -p.
+        if self.sqlmap_autoparam.get() and not bulk and (an_url or an_data):
+            params = self._extract_params(an_url, an_data)
+            if params:
+                self.append(w, "[*] Parameters seen: "
+                            + ", ".join(f"{n} ({wh})" for n, _v, wh in params) + "\n")
+                likely = self._likely_sql_params(params)
+                if likely:
+                    self.append(w, f"[*] Likely-injectable -> testing with -p {','.join(likely)}\n")
+                    cmd += ["-p", ",".join(likely)]
+                else:
+                    self.append(w, "[*] No stand-out params; letting sqlmap test them all.\n")
+            else:
+                self.append(w, "[*] No URL/body params found; sqlmap will auto-discover.\n")
+        # WAF detection -> adapt tamper scripts to the detected WAF.
+        waf = None
+        if self.sqlmap_waf.get() and an_url.startswith("http"):
+            waf = self._waf_detect(an_url, w)
+        if waf:
+            tamper = self.WAF_TAMPER.get(waf, self.WAF_TAMPER["Generic/Unknown WAF"])
+            self.append(w, f"[+] {waf} -> --tamper={tamper} (+ --random-agent --delay 1)\n")
+            cmd += ["--tamper", tamper, "--random-agent", "--delay", "1"]
+        elif self.sqlmap_randagent.get():
+            cmd += ["--random-agent"]
+        cmd += ["--level", str(self.sqlmap_level.get()),
+                "--risk", str(self.sqlmap_risk.get())]
+        if self.sqlmap_dbs.get():
+            cmd += ["--dbs"]
+        if self.sqlmap_banner.get():
+            cmd += ["--banner"]
+        if self.sqlmap_curuser.get():
+            cmd += ["--current-user"]
+        cmd += ["--output-dir", outdir]
+        extra = self.sqlmap_extra.get().strip()
+        if extra:
+            try:
+                cmd += shlex.split(extra)
+            except ValueError:
+                cmd += extra.split()
+        cmd = self.augment(cmd, "sqlmap")
+        self.update_status("sqlmap running ...")
+        self.run_stream(cmd, w)
+        self.append(w, f"\n[+] sqlmap finished -> {outdir}\n")
+        self.update_status("sqlmap done.")
+
+    # ---- LFImap ---- #
+    def _build_lfimap_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="LFImap")
+        tab.columnconfigure(1, weight=1)
+        ttk.Label(tab, text="Target URL (mark the test point with PWN, e.g. "
+                            ".../page.php?file=PWN):").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0))
+        self.lfi_url = ttk.Entry(tab)
+        self.lfi_url.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        mrow = ttk.Frame(tab)
+        mrow.grid(row=2, column=0, columnspan=3, sticky="ew", padx=4)
+        ttk.Label(mrow, text="Method:").pack(side="left")
+        self.lfi_method = ttk.Combobox(mrow, state="readonly", width=7,
+                                       values=["GET", "POST"])
+        self.lfi_method.set("GET")
+        self.lfi_method.pack(side="left", padx=4)
+        ttk.Label(mrow, text="POST data:").pack(side="left", padx=(8, 2))
+        self.lfi_data = ttk.Entry(mrow)
+        self.lfi_data.pack(side="left", fill="x", expand=True)
+        frow = ttk.LabelFrame(tab, text="…or load from file", padding=6)
+        frow.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        frow.columnconfigure(1, weight=1)
+        ttk.Label(frow, text="Request file (-R):").grid(row=0, column=0, sticky="w")
+        self.lfi_reqfile = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.lfi_reqfile).grid(row=0, column=1,
+                                                            sticky="ew", padx=4)
+        ttk.Button(frow, text="Browse…", command=lambda: self._choose_file(
+            self.lfi_reqfile, [("HTTP request", "*.txt *.req *.http"),
+                               ("All files", "*")],
+            "Choose a saved HTTP request")).grid(row=0, column=2)
+        ttk.Label(frow, text="URL list (-F):").grid(row=1, column=0, sticky="w")
+        self.lfi_urlfile = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.lfi_urlfile).grid(row=1, column=1,
+                                                            sticky="ew", padx=4)
+        ttk.Button(frow, text="Browse…", command=lambda: self._choose_file(
+            self.lfi_urlfile, [("URL list", "*.txt"), ("All files", "*")],
+            "Choose a URL list")).grid(row=1, column=2)
+        tech = ttk.LabelFrame(tab, text="Local inclusion techniques (no callbacks)",
+                              padding=6)
+        tech.grid(row=4, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        self.lfi_tech = {}
+        for code, (_flag, label, default) in self.LFI_LOCAL_TECHNIQUES.items():
+            var = tk.BooleanVar(value=default)
+            self.lfi_tech[code] = var
+            ttk.Checkbutton(tech, text=label, variable=var).pack(side="left", padx=3)
+        cbf = ttk.LabelFrame(tab, text="External callback vectors "
+                                       "(require Settings opt-in)", padding=6)
+        cbf.grid(row=5, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        cbf.columnconfigure(2, weight=1)
+        self.lfi_rfi = tk.BooleanVar(value=False)
+        self.lfi_revshell = tk.BooleanVar(value=False)
+        self.lfi_cb_rfi = ttk.Checkbutton(cbf, text="RFI (-r)", variable=self.lfi_rfi)
+        self.lfi_cb_rfi.grid(row=0, column=0, sticky="w")
+        self.lfi_cb_rev = ttk.Checkbutton(cbf, text="Reverse shell (-x)",
+                                          variable=self.lfi_revshell)
+        self.lfi_cb_rev.grid(row=0, column=1, sticky="w", padx=8)
+        lh = ttk.Frame(cbf)
+        lh.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        ttk.Label(lh, text="lhost:").pack(side="left")
+        self.lfi_lhost = ttk.Entry(lh, width=16)
+        self.lfi_lhost.pack(side="left", padx=3)
+        ttk.Label(lh, text="lport:").pack(side="left")
+        self.lfi_lport = ttk.Entry(lh, width=7)
+        self.lfi_lport.pack(side="left", padx=3)
+        self.lfi_cb_status = ttk.Label(cbf, text="", wraplength=640, justify="left")
+        self.lfi_cb_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        o3 = ttk.Frame(tab)
+        o3.grid(row=6, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        ttk.Label(o3, text="Extra args:").pack(side="left")
+        self.lfi_extra = ttk.Entry(o3)
+        self.lfi_extra.pack(side="left", fill="x", expand=True, padx=4)
+        self.lfi_quick = tk.BooleanVar(value=False)
+        ttk.Checkbutton(o3, text="Quick (-q)",
+                        variable=self.lfi_quick).pack(side="left", padx=4)
+        btn = ttk.Button(tab, text="Run LFImap", command=self.start_lfimap)
+        btn.grid(row=7, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["lfimap"] = self._make_output(tab)
+        self._refresh_lfi_callback_ui()
+
+    def _refresh_lfi_callback_ui(self):
+        """Enable the callback widgets only when settings permit it; keep the
+        status line and the checkboxes honest otherwise."""
+        if not hasattr(self, "lfi_cb_status"):
+            return
+        allowed = self.gopts.get("lfi_allow_callbacks", False)
+        state = "normal" if allowed else "disabled"
+        for wdg in (self.lfi_cb_rfi, self.lfi_cb_rev, self.lfi_lhost, self.lfi_lport):
+            try:
+                wdg.configure(state=state)
+            except tk.TclError:
+                pass
+        if allowed:
+            host = self.gopts.get("oob_host", "").strip()
+            txt = "Callbacks ENABLED in settings. " + (
+                f"Callback host: {host}" if host else
+                "Set a Callback host in Settings for RFI payloads.")
+        else:
+            self.lfi_rfi.set(False)
+            self.lfi_revshell.set(False)
+            txt = ("Callbacks DISABLED — only local techniques run; no out-of-band "
+                   "traffic. Enable in Settings → Global request settings.")
+        self.lfi_cb_status.configure(text=txt)
+
+    def _scrub_lfi_callbacks(self, args, w):
+        """Strip any out-of-band LFImap flag (and its value) unless callbacks are
+        allowed in settings. This is the hard guarantee, independent of the UI."""
+        if self.gopts.get("lfi_allow_callbacks", False):
+            return args, False
+        with_val = {"--lhost", "--lport", "--callback"}
+        bare = {"-r", "--rfi", "-x", "--exploit", "-a", "--all"}
+        out, removed, skip = [], [], False
+        for a in args:
+            if skip:
+                skip = False
+                removed.append(a)
+                continue
+            key = a.split("=", 1)[0]
+            if key in with_val:
+                removed.append(a)
+                if "=" not in a:
+                    skip = True
+                continue
+            if key in bare:
+                removed.append(a)
+                continue
+            out.append(a)
+        if removed:
+            self.append(w, f"[safety] LFImap callbacks disabled — removed: "
+                           f"{' '.join(removed)}\n")
+        return out, bool(removed)
+
+    def start_lfimap(self):
+        reqfile = self.lfi_reqfile.get().strip()
+        urlfile = self.lfi_urlfile.get().strip()
+        url = self.lfi_url.get().strip()
+        if not (reqfile or urlfile or url):
+            messagebox.showwarning("Input", "Provide a URL, a request file, or a URL list.")
+            return
+        if reqfile and not os.path.isfile(reqfile):
+            messagebox.showwarning("Input", "Request file not found.")
+            return
+        if urlfile and not os.path.isfile(urlfile):
+            messagebox.showwarning("Input", "URL list file not found.")
+            return
+        if url and not reqfile and not urlfile and not is_url(url.replace("PWN", "1")):
+            messagebox.showwarning("Input", "Enter a valid target URL.")
+            return
+        self._launch(self.run_lfimap, self.outputs["lfimap"], ())
+
+    def run_lfimap(self):
+        w = self.outputs["lfimap"]
+        if not self.require(w, "lfimap"):
+            return
+        allowed = self.gopts.get("lfi_allow_callbacks", False)
+        reqfile = self.lfi_reqfile.get().strip()
+        urlfile = self.lfi_urlfile.get().strip()
+        url = self.lfi_url.get().strip()
+        host = ""
+        cmd = ["lfimap"]
+        if reqfile:
+            cmd += ["-R", reqfile]
+            parsed = self._parse_request_file(reqfile)
+            if parsed:
+                host = parsed["host"]
+        elif urlfile:
+            cmd += ["-F", urlfile]
+        else:
+            tgt = url if url.startswith("http") else "http://" + url
+            cmd += ["-U", tgt]
+            host = urlsplit(tgt.replace("PWN", "1")).hostname or ""
+            data = self.lfi_data.get().strip()
+            if data:
+                cmd += ["-D", data]
+            if self.lfi_method.get() != "GET":
+                cmd += ["-M", self.lfi_method.get()]
+        if host and not self._active_scope_ok(host, w):
+            self.append(w, f"[scope] {host} is out of scope — aborting.\n")
+            return
+        techs = [flag for code, (flag, _l, _d) in self.LFI_LOCAL_TECHNIQUES.items()
+                 if self.lfi_tech[code].get()]
+        callback_req = []
+        if self.lfi_rfi.get():
+            callback_req += ["-r"]
+        if self.lfi_revshell.get():
+            callback_req += ["-x"]
+            if self.lfi_lhost.get().strip():
+                callback_req += ["--lhost", self.lfi_lhost.get().strip()]
+            if self.lfi_lport.get().strip():
+                callback_req += ["--lport", self.lfi_lport.get().strip()]
+        cb_host = self.gopts.get("oob_host", "").strip()
+        if allowed and self.lfi_rfi.get() and cb_host:
+            callback_req += ["--callback", cb_host]
+        callback_clean, _ = self._scrub_lfi_callbacks(callback_req, w)
+        if not allowed and not techs:
+            self.append(w, "[!] No local technique selected; defaulting to "
+                           "heuristics + PHP filter.\n")
+            techs = ["-heur", "-f"]
+        cmd += techs + callback_clean
+        if self.gopts["cookie"].strip():
+            cmd += ["-C", self.gopts["cookie"].strip()]
+        if self._proxy_url():
+            cmd += ["-P", self._proxy_url()]
+        for h in self._all_headers():
+            if h.lower().startswith("cookie:"):
+                continue   # already sent via -C
+            cmd += ["-H", h]
+        if self.lfi_quick.get():
+            cmd += ["-q"]
+        extra = self.lfi_extra.get().strip()
+        if extra:
+            try:
+                extra_tokens = shlex.split(extra)
+            except ValueError:
+                extra_tokens = extra.split()
+            extra_tokens, _ = self._scrub_lfi_callbacks(extra_tokens, w)
+            cmd += extra_tokens
+        self.append(w, f"[*] Callbacks: "
+                    f"{'ALLOWED' if allowed else 'DISABLED (local techniques only)'}\n")
+        self.update_status("lfimap running ...")
+        self.run_stream(cmd, w)
+        self.append(w, "\n[+] lfimap finished.\n")
+        self.update_status("lfimap done.")
+
+    # ---- Dalfox ---- #
+    def _build_dalfox_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Dalfox")
+        tab.columnconfigure(1, weight=1)
+        ttk.Label(tab, text="Target URL (XSS; include params, e.g. "
+                            "https://site/search?q=test):").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0))
+        self.dalfox_url = ttk.Entry(tab)
+        self.dalfox_url.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        mrow = ttk.Frame(tab)
+        mrow.grid(row=2, column=0, columnspan=3, sticky="ew", padx=4)
+        ttk.Label(mrow, text="Method:").pack(side="left")
+        self.dalfox_method = ttk.Combobox(mrow, state="readonly", width=7,
+                                          values=["GET", "POST"])
+        self.dalfox_method.set("GET")
+        self.dalfox_method.pack(side="left", padx=4)
+        ttk.Label(mrow, text="POST data:").pack(side="left", padx=(8, 2))
+        self.dalfox_data = ttk.Entry(mrow)
+        self.dalfox_data.pack(side="left", fill="x", expand=True)
+        frow = ttk.LabelFrame(tab, text="…or load a URL list file (dalfox file)",
+                              padding=6)
+        frow.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        frow.columnconfigure(1, weight=1)
+        ttk.Label(frow, text="URL list:").grid(row=0, column=0, sticky="w")
+        self.dalfox_file = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.dalfox_file).grid(row=0, column=1,
+                                                            sticky="ew", padx=4)
+        ttk.Button(frow, text="Browse…", command=lambda: self._choose_file(
+            self.dalfox_file, [("URL list", "*.txt"), ("All files", "*")],
+            "Choose a URL list")).grid(row=0, column=2)
+        o1 = ttk.Frame(tab)
+        o1.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        ttk.Label(o1, text="Workers:").pack(side="left")
+        self.dalfox_workers = tk.IntVar(value=40)
+        ttk.Spinbox(o1, from_=1, to=200, width=5,
+                    textvariable=self.dalfox_workers).pack(side="left", padx=4)
+        self.dalfox_wafevasion = tk.BooleanVar(value=True)
+        ttk.Checkbutton(o1, text="--waf-evasion",
+                        variable=self.dalfox_wafevasion).pack(side="left", padx=6)
+        self.dalfox_followredirect = tk.BooleanVar(value=False)
+        ttk.Checkbutton(o1, text="--follow-redirects",
+                        variable=self.dalfox_followredirect).pack(side="left")
+        bl = ttk.Frame(tab)
+        bl.grid(row=5, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        ttk.Label(bl, text="Blind XSS callback (optional, -b):").pack(side="left")
+        self.dalfox_blind = ttk.Entry(bl)
+        self.dalfox_blind.pack(side="left", fill="x", expand=True, padx=4)
+        o3 = ttk.Frame(tab)
+        o3.grid(row=6, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        ttk.Label(o3, text="Extra args:").pack(side="left")
+        self.dalfox_extra = ttk.Entry(o3)
+        self.dalfox_extra.pack(side="left", fill="x", expand=True, padx=4)
+        btn = ttk.Button(tab, text="Run Dalfox", command=self.start_dalfox)
+        btn.grid(row=7, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["dalfox"] = self._make_output(tab)
+
+    def start_dalfox(self):
+        f = self.dalfox_file.get().strip()
+        url = self.dalfox_url.get().strip()
+        if not (f or url):
+            messagebox.showwarning("Input", "Provide a URL or a URL list file.")
+            return
+        if f and not os.path.isfile(f):
+            messagebox.showwarning("Input", "URL list file not found.")
+            return
+        if url and not f and not is_url(url):
+            messagebox.showwarning("Input", "Enter a valid target URL.")
+            return
+        self._launch(self.run_dalfox, self.outputs["dalfox"], ())
+
+    def run_dalfox(self):
+        w = self.outputs["dalfox"]
+        if not self.require(w, "dalfox"):
+            return
+        f = self.dalfox_file.get().strip()
+        url = self.dalfox_url.get().strip()
+        host = ""
+        cmd = ["dalfox"]
+        if f:
+            cmd += ["file", f]
+        else:
+            tgt = url if url.startswith("http") else "http://" + url
+            cmd += ["url", tgt]
+            host = urlsplit(tgt).hostname or ""
+        if host and not self._active_scope_ok(host, w):
+            self.append(w, f"[scope] {host} is out of scope — aborting.\n")
+            return
+        outdir = self.state["outdir"] or self._new_outdir(host or "dalfox")
+        out = os.path.join(outdir, "dalfox.txt")
+        cmd += ["-w", str(self.dalfox_workers.get()), "--no-color", "-o", out]
+        if self.dalfox_method.get() == "POST":
+            cmd += ["-X", "POST"]
+        data = self.dalfox_data.get().strip()
+        if data:
+            cmd += ["-d", data]
+        if self.dalfox_wafevasion.get():
+            cmd += ["--waf-evasion"]
+        if self.dalfox_followredirect.get():
+            cmd += ["--follow-redirects"]
+        blind = self.dalfox_blind.get().strip()
+        if blind:
+            cmd += ["-b", blind]
+        extra = self.dalfox_extra.get().strip()
+        if extra:
+            try:
+                cmd += shlex.split(extra)
+            except ValueError:
+                cmd += extra.split()
+        cmd = self.augment(cmd, "dalfox")
+        self.update_status("dalfox running ...")
+        self.run_stream(cmd, w)
+        self.append(w, f"\n[+] dalfox finished -> {out}\n")
+        self.update_status("dalfox done.")
 
 if __name__ == "__main__":
     root = tk.Tk()
