@@ -28,7 +28,7 @@ import random
 import string
 import time
 import shlex
-from urllib.parse import urlsplit, parse_qsl, quote
+from urllib.parse import urlsplit, parse_qsl, quote, urlencode
 
 try:
     import pyfiglet
@@ -363,7 +363,7 @@ PROXY_FLAG = {
     "httpx": "-http-proxy", "katana": "-proxy", "nuclei": "-proxy",
     "dnsx": "-proxy", "naabu": "-proxy", "ffuf": "-x",
     "wpscan": "--proxy", "nikto": "-useproxy", "kr": "--proxy",
-    "sqlmap": "--proxy", "dalfox": "--proxy",
+    "sqlmap": "--proxy", "dalfox": "--proxy", "crlfuzz": "-x",
 }
 # Requests/sec cap per tool (0/unset = no cap). ffuf/dirb carry their own in the
 # Dir Busting tab, so they're injected there, not globally.
@@ -382,6 +382,7 @@ HEADER_STYLE = {
     "wpscan": ("--headers", "join"), "arjun": ("--headers", "nl"),
     "kr": ("-H", "repeat"),
     "sqlmap": ("-H", "repeat"), "dalfox": ("-H", "repeat"),
+    "crlfuzz": ("-H", "repeat"),
 }
 DEFAULT_SETTINGS = {
     "proxy_on": False, "proxy_url": "http://127.0.0.1:8080",
@@ -397,6 +398,29 @@ DEFAULT_SETTINGS = {
     # Active Testing: LFImap must never reach out-of-band unless explicitly allowed
     "lfi_allow_callbacks": False,  # permit LFImap RFI / reverse-shell / --callback vectors
 }
+
+# Install one-liner for Python git-clone tools: clone into a shared dir + venv,
+# then drop a PATH wrapper in ~/.local/bin so shutil.which() can find them.
+GR_PYTOOL_INSTALL = (
+    'GRT="$HOME/.local/share/ghostrecon-tools"; '
+    'mkdir -p "$GRT" "$HOME/.local/bin"; '
+    'test -d "$GRT/{name}" || git clone --depth 1 {repo} "$GRT/{name}"; '
+    'test -d "$GRT/.venv" || python3 -m venv "$GRT/.venv"; '
+    '"$GRT/.venv/bin/pip" install -q {deps}; '
+    "printf '#!/bin/sh\\nexec \"%s\" \"%s\" \"$@\"\\n' "
+    '"$GRT/.venv/bin/python" "$GRT/{entry}" > "$HOME/.local/bin/{cmd}"; '
+    'chmod +x "$HOME/.local/bin/{cmd}"'
+)
+# trufflehog can't `go install` (replace directives) -> fetch the release binary.
+GR_TRUFFLEHOG_INSTALL = (
+    'mkdir -p "$HOME/.local/bin"; '
+    'ARCH=$(uname -m | sed "s/aarch64/arm64/;s/x86_64/amd64/"); '
+    'URL=$(curl -s https://api.github.com/repos/trufflesecurity/trufflehog/releases/latest '
+    '| grep -o "https://[^\\"]*linux_${ARCH}.tar.gz" | head -1); '
+    'curl -sSL -o /tmp/gr_th.tgz "$URL"; '
+    'tar -xzf /tmp/gr_th.tgz -C "$HOME/.local/bin" trufflehog; '
+    'chmod +x "$HOME/.local/bin/trufflehog"; rm -f /tmp/gr_th.tgz'
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -791,6 +815,7 @@ class GhostReconGUI:
         self._build_reconplus_tab()
         self._build_webscan_tab()
         self._build_active_tab()
+        self._build_vulnscan_tab()
 
         # Bottom control/status bar
         bottom = ttk.Frame(self.master, padding=(8, 4))
@@ -1705,6 +1730,11 @@ class GhostReconGUI:
         "sqlmap": "https://github.com/sqlmapproject/sqlmap",
         "lfimap": "https://github.com/hansmach1ne/LFImap",
         "dalfox": "https://github.com/hahwul/dalfox",
+        "corsy": "https://github.com/s0md3v/Corsy",
+        "crlfuzz": "https://github.com/dwisiswant0/crlfuzz",
+        "openredirex": "https://github.com/devanshbatham/OpenRedireX",
+        "gitleaks": "https://github.com/gitleaks/gitleaks",
+        "trufflehog": "https://github.com/trufflesecurity/trufflehog",
     }
 
     # How to install each tool. "go"/"pip" entries run without sudo; "apt" needs sudo.
@@ -1735,6 +1765,19 @@ class GhostReconGUI:
         "sqlmap":    ("apt", "sudo apt-get install -y sqlmap"),
         "lfimap":    ("pip", "pipx install lfimap 2>/dev/null || pip3 install --user lfimap"),
         "dalfox":    ("go", "go install github.com/hahwul/dalfox/v2@latest"),
+        "crlfuzz":   ("go", "go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest"),
+        "gitleaks":  ("go", "go install github.com/zricethezav/gitleaks/v8@latest"),
+        # Python git-clone tools: clone into a shared dir + venv, then drop a
+        # PATH wrapper in ~/.local/bin so `which` finds them.
+        "corsy":     ("pip", GR_PYTOOL_INSTALL.format(
+                        repo="https://github.com/s0md3v/Corsy", name="Corsy",
+                        deps="requests", cmd="corsy", entry="Corsy/corsy.py")),
+        "openredirex": ("pip", GR_PYTOOL_INSTALL.format(
+                        repo="https://github.com/devanshbatham/OpenRedireX",
+                        name="OpenRedireX", deps="aiohttp tqdm", cmd="openredirex",
+                        entry="OpenRedireX/openredirex.py")),
+        # trufflehog can't `go install` (replace directives); fetch the release binary.
+        "trufflehog": ("pip", GR_TRUFFLEHOG_INSTALL),
     }
     # Tools that are optional enhancers: never block a stage, just improve it.
     OPTIONAL_TOOLS = {"jsluice", "subzy", "x8", "js-beautify", "kr"}
@@ -4239,6 +4282,546 @@ class GhostReconGUI:
         self.run_stream(cmd, w)
         self.append(w, f"\n[+] dalfox finished -> {out}\n")
         self.update_status("dalfox done.")
+
+    # ================================================================== #
+    # Vuln Scan tab (CORS · CRLF · Open Redirect · SSRF · Secrets · Exposure)
+    # ================================================================== #
+    # Common redirect-sink parameter names, used when a URL carries no params.
+    REDIRECT_PARAMS = ["url", "next", "redirect", "redirect_url", "redir", "return",
+                       "returnUrl", "return_url", "dest", "destination", "target",
+                       "goto", "continue", "r", "u", "link", "out", "view", "to"]
+    # Common SSRF-sink parameter names.
+    SSRF_PARAMS = ["url", "uri", "u", "path", "dest", "redirect", "next", "data",
+                   "file", "host", "port", "to", "out", "view", "dir", "show",
+                   "site", "callback", "target", "domain", "feed", "page", "proxy",
+                   "fetch", "resource", "load", "image", "img", "api", "endpoint"]
+    # Sensitive paths probed by the Exposure module. value = substrings that must
+    # appear in a 200 body to count as a real hit (empty = any non-soft-404 200).
+    EXPOSURE_PATHS = {
+        ".env": ["="], ".env.local": ["="], ".env.bak": ["="], ".env.prod": ["="],
+        ".git/config": ["[core]"], ".git/HEAD": ["ref:"], ".gitignore": [],
+        ".svn/entries": [], ".hg/hgrc": [], ".DS_Store": [],
+        "config.php.bak": ["<?php"], "config.php~": ["<?php"],
+        "wp-config.php.bak": ["<?php"], "configuration.php.bak": ["<?php"],
+        "backup.zip": ["PK"], "backup.tar.gz": [], "backup.sql": [], "db.sql": [],
+        "dump.sql": [], "database.sql": [], ".htpasswd": [":"], ".htaccess": [],
+        "phpinfo.php": ["phpinfo"], "info.php": ["phpinfo"], "server-status": [],
+        "web.config": ["<configuration"], ".aws/credentials": ["aws_"],
+        "id_rsa": ["PRIVATE KEY"], ".ssh/id_rsa": ["PRIVATE KEY"],
+        ".npmrc": [], ".dockerenv": [], "docker-compose.yml": ["services:"],
+        ".vscode/sftp.json": ["host"], "sftp-config.json": ["host"],
+        ".gitlab-ci.yml": [], ".travis.yml": [], ".bash_history": [],
+        "composer.lock": [], "package-lock.json": [], "yarn.lock": [],
+    }
+
+    def _build_vulnscan_tab(self):
+        outer = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(outer, text="10. Vuln Scan")
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        inner = ttk.Notebook(outer)
+        inner.grid(row=0, column=0, sticky="nsew")
+        self._build_cors_subtab(inner)
+        self._build_crlf_subtab(inner)
+        self._build_openredirect_subtab(inner)
+        self._build_ssrf_subtab(inner)
+        self._build_secrets_subtab(inner)
+        self._build_exposure_subtab(inner)
+
+    # ---- shared helpers ---- #
+    def _tmp_list(self, lines, suffix=".txt"):
+        f = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False)
+        f.write("\n".join(lines) + "\n")
+        f.close()
+        return f.name
+
+    def _rand_token(self, n=10):
+        return "gr" + "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+    def _set_param(self, url, key, value):
+        """Return url with query param `key` set to `value` (added if absent)."""
+        parts = urlsplit(url if url.startswith("http") else "http://" + url)
+        params = parse_qsl(parts.query, keep_blank_values=True)
+        if any(k == key for k, _ in params):
+            newp = [(k, value if k == key else v) for k, v in params]
+        else:
+            newp = params + [(key, value)]
+        q = urlencode(newp)
+        return f"{parts.scheme}://{parts.netloc}{parts.path}" + (f"?{q}" if q else "")
+
+    def _vuln_url_input(self, nb, title, label):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text=title)
+        box = self._mini_targets(
+            tab, label,
+            [("Load URLs (stage 3)", lambda: self._fill(box, self.state["urls"])),
+             ("Load live URLs",
+              lambda: self._fill(box, self.state.get("live_urls", [])))])
+        return tab, box
+
+    # ---- CORS (corsy) ---- #
+    def _build_cors_subtab(self, nb):
+        tab, self.cors_input = self._vuln_url_input(
+            nb, "CORS", "URLs to test for CORS misconfiguration (corsy):")
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text="Threads:").pack(side="left")
+        self.cors_threads = tk.IntVar(value=5)
+        ttk.Spinbox(opt, from_=1, to=50, width=5,
+                    textvariable=self.cors_threads).pack(side="left", padx=4)
+        btn = ttk.Button(tab, text="Scan CORS", command=self.start_cors)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["cors"] = self._make_output(tab)
+
+    def start_cors(self):
+        urls = [u for u in self._lines_from(self.cors_input) if is_url(u)]
+        urls = self.scope_filter(urls, self.outputs["cors"])
+        if not urls:
+            messagebox.showwarning("Input", "No valid in-scope URLs.")
+            return
+        self._launch(self.run_cors, self.outputs["cors"], (urls,))
+
+    def run_cors(self, urls):
+        w = self.outputs["cors"]
+        if not self.require(w, "corsy"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', urls[0]).split("/")[0])
+        infile = self._tmp_list(urls)
+        out = os.path.join(outdir, "corsy_cors.txt")
+        # corsy reads its input file (-i) only when stdin is a TTY; under a
+        # subprocess it reads URLs from stdin, so feed them that way.
+        cmd = f"corsy -t {int(self.cors_threads.get())} < {shlex.quote(infile)}"
+        self.update_status(f"corsy: {len(urls)} URL(s) ...")
+        self.run_stream(cmd, w, shell=True, outfile=out)
+        self.append(w, f"\n[+] CORS scan done -> {out}\n")
+        self.update_status("CORS scan done.")
+        try:
+            os.unlink(infile)
+        except OSError:
+            pass
+
+    # ---- CRLF (crlfuzz) ---- #
+    def _build_crlf_subtab(self, nb):
+        tab, self.crlf_input = self._vuln_url_input(
+            nb, "CRLF", "URLs to test for CRLF injection (crlfuzz):")
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text="Concurrency:").pack(side="left")
+        self.crlf_conc = tk.IntVar(value=20)
+        ttk.Spinbox(opt, from_=1, to=100, width=5,
+                    textvariable=self.crlf_conc).pack(side="left", padx=4)
+        ttk.Label(opt, text="Method:").pack(side="left")
+        self.crlf_method = ttk.Combobox(opt, state="readonly", width=7,
+                                        values=["GET", "POST"])
+        self.crlf_method.set("GET")
+        self.crlf_method.pack(side="left", padx=4)
+        btn = ttk.Button(tab, text="Scan CRLF", command=self.start_crlf)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["crlf"] = self._make_output(tab)
+
+    def start_crlf(self):
+        urls = [u for u in self._lines_from(self.crlf_input) if is_url(u)]
+        urls = self.scope_filter(urls, self.outputs["crlf"])
+        if not urls:
+            messagebox.showwarning("Input", "No valid in-scope URLs.")
+            return
+        self._launch(self.run_crlf, self.outputs["crlf"], (urls,))
+
+    def run_crlf(self, urls):
+        w = self.outputs["crlf"]
+        if not self.require(w, "crlfuzz"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', urls[0]).split("/")[0])
+        infile = self._tmp_list(urls)
+        out = os.path.join(outdir, "crlfuzz.txt")
+        cmd = ["crlfuzz", "-l", infile, "-c", str(self.crlf_conc.get()), "-o", out]
+        if self.crlf_method.get() == "POST":
+            cmd += ["-X", "POST"]
+        cmd = self.augment(cmd, "crlfuzz")
+        self.update_status(f"crlfuzz: {len(urls)} URL(s) ...")
+        self.run_stream(cmd, w)
+        self.append(w, f"\n[+] CRLF scan done -> {out}\n")
+        self.update_status("CRLF scan done.")
+        try:
+            os.unlink(infile)
+        except OSError:
+            pass
+
+    # ---- Open Redirect (openredirex) ---- #
+    def _build_openredirect_subtab(self, nb):
+        tab, self.oredir_input = self._vuln_url_input(
+            nb, "Open Redirect",
+            "URLs to test for open redirect (openredirex). "
+            "Params are auto-fuzzed; or put FUZZ yourself:")
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text="Concurrency:").pack(side="left")
+        self.oredir_conc = tk.IntVar(value=30)
+        ttk.Spinbox(opt, from_=1, to=200, width=5,
+                    textvariable=self.oredir_conc).pack(side="left", padx=4)
+        btn = ttk.Button(tab, text="Scan Open Redirect",
+                         command=self.start_openredirect)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["openredirect"] = self._make_output(tab)
+
+    def _fuzzify_urls(self, urls):
+        """Produce FUZZ-marked URLs: one per existing param, else per common
+        redirect param. openredirex swaps FUZZ for each payload."""
+        out = []
+        for u in urls:
+            if "FUZZ" in u:
+                out.append(u)
+                continue
+            parts = urlsplit(u if u.startswith("http") else "http://" + u)
+            params = parse_qsl(parts.query, keep_blank_values=True)
+            base = f"{parts.scheme}://{parts.netloc}{parts.path}"
+            if params:
+                for i in range(len(params)):
+                    q = urlencode([(k, "FUZZ" if j == i else v)
+                                   for j, (k, v) in enumerate(params)], safe="")
+                    out.append(f"{base}?{q}")
+            else:
+                for p in self.REDIRECT_PARAMS[:6]:
+                    out.append(f"{base}?{p}=FUZZ")
+        return sorted(set(out))
+
+    def start_openredirect(self):
+        urls = [u for u in self._lines_from(self.oredir_input) if is_url(u)]
+        urls = self.scope_filter(urls, self.outputs["openredirect"])
+        if not urls:
+            messagebox.showwarning("Input", "No valid in-scope URLs.")
+            return
+        self._launch(self.run_openredirect, self.outputs["openredirect"], (urls,))
+
+    def run_openredirect(self, urls):
+        w = self.outputs["openredirect"]
+        if not self.require(w, "openredirex"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', urls[0]).split("/")[0])
+        fuzzed = self._fuzzify_urls(urls)
+        infile = self._tmp_list(fuzzed)
+        out = os.path.join(outdir, "openredirect.txt")
+        # openredirex reads target URLs from stdin and swaps the FUZZ keyword.
+        cmd = (f"openredirex -k FUZZ -c {int(self.oredir_conc.get())} "
+               f"< {shlex.quote(infile)}")
+        self.append(w, f"[*] {len(fuzzed)} fuzz-URL(s) from {len(urls)} input(s)\n")
+        self.update_status("openredirex running ...")
+        self.run_stream(cmd, w, shell=True, outfile=out)
+        self.append(w, f"\n[+] Open redirect scan done -> {out}\n")
+        self.update_status("Open redirect scan done.")
+        try:
+            os.unlink(infile)
+        except OSError:
+            pass
+
+    # ---- SSRF (custom callback-injection module) ---- #
+    def _build_ssrf_subtab(self, nb):
+        tab, self.ssrf_input = self._vuln_url_input(
+            nb, "SSRF", "URLs to test for SSRF (params injected with a callback):")
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text="Callback:").pack(side="left")
+        self.ssrf_mode = ttk.Combobox(opt, state="readonly", width=22,
+                                      values=["Built-in listener",
+                                              "OAST host (from settings)"])
+        self.ssrf_mode.set("Built-in listener")
+        self.ssrf_mode.pack(side="left", padx=4)
+        ttk.Label(opt, text="Listener host:").pack(side="left")
+        self.ssrf_host = ttk.Entry(opt, width=14)
+        self.ssrf_host.insert(0, "127.0.0.1")
+        self.ssrf_host.pack(side="left", padx=4)
+        ttk.Label(opt, text="port:").pack(side="left")
+        self.ssrf_port = tk.IntVar(value=8749)
+        ttk.Spinbox(opt, from_=1024, to=65535, width=7,
+                    textvariable=self.ssrf_port).pack(side="left", padx=4)
+        opt2 = ttk.Frame(tab)
+        opt2.grid(row=4, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        self.ssrf_metadata = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt2, text="Also test cloud metadata in-band "
+                                   "(169.254.169.254)", variable=self.ssrf_metadata
+                        ).pack(side="left")
+        ttk.Label(opt2, text="   Listener host must be reachable from the target "
+                            "(set your IP for external targets).",
+                  foreground="#888").pack(side="left")
+        btn = ttk.Button(tab, text="Scan SSRF", command=self.start_ssrf)
+        btn.grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["ssrf"] = self._make_output(tab)
+
+    def start_ssrf(self):
+        urls = [u for u in self._lines_from(self.ssrf_input) if is_url(u)]
+        urls = self.scope_filter(urls, self.outputs["ssrf"])
+        if not urls:
+            messagebox.showwarning("Input", "No valid in-scope URLs.")
+            return
+        self._launch(self.run_ssrf, self.outputs["ssrf"], (urls,))
+
+    def _start_ssrf_listener(self, port, w):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        hits = set()
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _hit(self):
+                tok = self.path.strip("/").split("/")[0].split("?")[0]
+                if tok:
+                    hits.add(tok)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            do_GET = _hit
+            do_POST = _hit
+            do_HEAD = _hit
+
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0", port), H)
+        except OSError as e:
+            self.append(w, f"[!] Could not bind callback listener on :{port}: {e}\n")
+            return None, hits
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.append(w, f"[*] Callback listener bound on 0.0.0.0:{port}\n")
+        return srv, hits
+
+    def run_ssrf(self, urls):
+        w = self.outputs["ssrf"]
+        if not self.require(w, "curl"):
+            return
+        mode = self.ssrf_mode.get()
+        srv, hits = None, set()
+        if mode.startswith("Built-in"):
+            srv, hits = self._start_ssrf_listener(self.ssrf_port.get(), w)
+            if srv is None:
+                return
+            cb_base = f"http://{self.ssrf_host.get().strip() or '127.0.0.1'}:{self.ssrf_port.get()}"
+            oast = False
+        else:
+            host = self.gopts.get("oob_host", "").strip()
+            if not host:
+                self.append(w, "[!] No OAST callback host set (Settings → Global "
+                               "request settings → Callback host).\n")
+                return
+            cb_base = host
+            oast = True
+        token_map = {}      # token -> (url, param)
+        probes = 0
+        for u in urls:
+            if self.stop_requested:
+                break
+            params = self._extract_params(u)
+            names = [k for k, _v, _wh in params] or self.SSRF_PARAMS
+            for k in names:
+                if self.stop_requested:
+                    break
+                tok = self._rand_token()
+                payload = (f"http://{tok}.{cb_base}" if oast
+                           else f"{cb_base}/{tok}")
+                token_map[tok] = (u, k)
+                test = self._set_param(u, k, payload)
+                self._curl_probe(test)   # fire-and-forget blind probe
+                probes += 1
+                # in-band cloud-metadata check
+                if self.ssrf_metadata.get():
+                    meta = self._set_param(
+                        u, k, "http://169.254.169.254/latest/meta-data/")
+                    _status, blob = self._http_capture(meta, timeout=6)
+                    if any(s in blob for s in ("ami-id", "instance-id",
+                                               "iam/security-credentials",
+                                               "computemetadata", "meta-data/")):
+                        self.append(w, f"  [SSRF/metadata] {u} param '{k}' "
+                                       f"returned cloud metadata!\n")
+        self.append(w, f"[*] Sent {probes} injected probe(s); waiting for callbacks ...\n")
+        for _ in range(12):      # ~6s grace, interruptible
+            if self.stop_requested or (srv and hits):
+                pass
+            time.sleep(0.5)
+        confirmed = []
+        for tok in sorted(hits):
+            u, k = token_map.get(tok, ("?", "?"))
+            confirmed.append((u, k))
+            self.append(w, f"  [SSRF CONFIRMED] {u}  param '{k}'  (callback {tok})\n")
+        if srv:
+            srv.shutdown()
+        if not confirmed:
+            self.append(w, "[*] No blind callbacks received.\n")
+            if oast:
+                self.append(w, "    (OAST mode: also check your interactsh/"
+                               "collaborator client for the tokens above.)\n")
+        self.append(w, f"\n[+] SSRF scan done — {len(confirmed)} confirmed, "
+                       f"{probes} probe(s).\n")
+        self.update_status(f"SSRF done: {len(confirmed)} confirmed.")
+
+    # ---- Secrets (gitleaks + trufflehog) ---- #
+    def _build_secrets_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Secrets")
+        tab.columnconfigure(0, weight=1)
+        ttk.Label(tab, text="Local path (git repo or directory) to scan:").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0))
+        prow = ttk.Frame(tab)
+        prow.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        prow.columnconfigure(0, weight=1)
+        self.secrets_path = tk.StringVar()
+        ttk.Entry(prow, textvariable=self.secrets_path).grid(row=0, column=0, sticky="ew")
+        ttk.Button(prow, text="Browse dir…", command=lambda: self._choose_dir(
+            self.secrets_path)).grid(row=0, column=1, padx=4)
+        ttk.Button(prow, text="Browse file…", command=lambda: self._choose_file(
+            self.secrets_path, [("All files", "*")],
+            "Choose a file to scan")).grid(row=0, column=2)
+        ttk.Label(tab, text="…or a git URL to clone & scan:").grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+        self.secrets_giturl = ttk.Entry(tab)
+        self.secrets_giturl.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4, pady=2)
+        opt = ttk.Frame(tab)
+        opt.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        self.secrets_gitleaks = tk.BooleanVar(value=True)
+        self.secrets_trufflehog = tk.BooleanVar(value=True)
+        self.secrets_verified = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text="gitleaks",
+                        variable=self.secrets_gitleaks).pack(side="left")
+        ttk.Checkbutton(opt, text="trufflehog",
+                        variable=self.secrets_trufflehog).pack(side="left", padx=6)
+        ttk.Checkbutton(opt, text="trufflehog: only verified",
+                        variable=self.secrets_verified).pack(side="left")
+        btn = ttk.Button(tab, text="Scan for secrets", command=self.start_secrets)
+        btn.grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["secrets"] = self._make_output(tab)
+
+    def _choose_dir(self, var):
+        path = filedialog.askdirectory(title="Choose a directory")
+        if path:
+            var.set(path)
+
+    def start_secrets(self):
+        path = self.secrets_path.get().strip()
+        giturl = self.secrets_giturl.get().strip()
+        if not path and not giturl:
+            messagebox.showwarning("Input", "Provide a local path or a git URL.")
+            return
+        if path and not os.path.exists(path):
+            messagebox.showwarning("Input", "Path not found.")
+            return
+        self._launch(self.run_secrets, self.outputs["secrets"], ())
+
+    def run_secrets(self):
+        w = self.outputs["secrets"]
+        path = self.secrets_path.get().strip()
+        giturl = self.secrets_giturl.get().strip()
+        cleanup = None
+        if giturl and not path:
+            if not self.require(w, "git"):
+                return
+            cleanup = tempfile.mkdtemp(prefix="gr-secrets-")
+            path = cleanup
+            self.append(w, f"[*] Cloning {giturl} ...\n")
+            self.run_stream(["git", "clone", giturl, path], w)
+        if not path or not os.path.exists(path):
+            self.append(w, "[!] Nothing to scan.\n")
+            return
+        name = os.path.basename(path.rstrip("/")) or "secrets"
+        outdir = self.state["outdir"] or self._new_outdir(name)
+        is_git = os.path.isdir(os.path.join(path, ".git"))
+        self.append(w, f"[*] Scanning {'git repo' if is_git else 'directory/file'}: {path}\n")
+        if self.secrets_gitleaks.get() and self.require(w, "gitleaks"):
+            self.append(w, "\n=== gitleaks ===\n")
+            out = os.path.join(outdir, "gitleaks.json")
+            cmd = ["gitleaks", "detect", "--source", path, "--no-banner", "-v",
+                   "--report-path", out]
+            if not is_git:
+                cmd.append("--no-git")
+            self.run_stream(cmd, w)
+        if self.secrets_trufflehog.get() and self.require(w, "trufflehog"):
+            self.append(w, "\n=== trufflehog ===\n")
+            results = "verified" if self.secrets_verified.get() \
+                else "verified,unknown,unverified"
+            if is_git:
+                cmd = ["trufflehog", "git", "file://" + os.path.abspath(path),
+                       "--results=" + results, "--no-update"]
+            else:
+                cmd = ["trufflehog", "filesystem", path,
+                       "--results=" + results, "--no-update"]
+            self.run_stream(cmd, w)
+        if cleanup:
+            shutil.rmtree(cleanup, ignore_errors=True)
+        self.append(w, f"\n[+] Secret scan done -> {outdir}\n")
+        self.update_status("Secret scan done.")
+
+    # ---- Exposure (.env / backups / VCS metadata) ---- #
+    def _build_exposure_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Exposure")
+        self.exposure_input = self._mini_targets(
+            tab, "Base URLs / hosts to check for exposed sensitive files:",
+            [("Load live URLs",
+              lambda: self._fill(self.exposure_input,
+                                 self.state.get("live_urls")
+                                 or self.state["live_hosts"]))])
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        ttk.Label(opt, text=f"{len(self.EXPOSURE_PATHS)} paths per host "
+                            "(.env, .git, backups, configs). Soft-404 aware.",
+                  foreground="#888").pack(side="left")
+        btn = ttk.Button(tab, text="Check exposure", command=self.start_exposure)
+        btn.grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        self.run_buttons.append(btn)
+        self.outputs["exposure"] = self._make_output(tab)
+
+    def start_exposure(self):
+        targets = [t for t in self._lines_from(self.exposure_input)
+                   if is_url(t) or is_host(t)]
+        targets = self.scope_filter(targets, self.outputs["exposure"])
+        if not targets:
+            messagebox.showwarning("Input", "No valid in-scope targets.")
+            return
+        self._launch(self.run_exposure, self.outputs["exposure"], (targets,))
+
+    def run_exposure(self, targets):
+        w = self.outputs["exposure"]
+        if not self.require(w, "curl"):
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', targets[0]).split("/")[0])
+        found = []
+        for base in targets:
+            if self.stop_requested:
+                break
+            base = base.rstrip("/")
+            if not base.startswith("http"):
+                base = "http://" + base
+            # soft-404 baseline: a random path that should not exist
+            b_code, b_size = self._curl_probe(f"{base}/{self._rand_token()}.html")
+            soft404 = (b_code == "200")
+            self.append(w, f"\n=== {base}  (baseline {b_code}/{b_size}B"
+                           f"{', soft-404!' if soft404 else ''}) ===\n")
+            for path, sigs in self.EXPOSURE_PATHS.items():
+                if self.stop_requested:
+                    break
+                url = f"{base}/{path}"
+                code, size = self._curl_probe(url)
+                if code != "200":
+                    continue
+                if soft404 and size == b_size:
+                    continue      # identical to the catch-all 200 page
+                if sigs:          # confirm content signature when we have one
+                    _st, blob = self._http_capture(url, timeout=8)
+                    if not any(s.lower() in blob for s in sigs):
+                        continue
+                self.append(w, f"  [EXPOSED] {url}  ({size}B)\n")
+                found.append(url)
+        out = os.path.join(outdir, "exposure.txt")
+        with open(out, "w") as f:
+            f.write("\n".join(found) + ("\n" if found else ""))
+        self.append(w, f"\n[+] Exposure check done — {len(found)} hit(s) -> {out}\n")
+        self.update_status(f"Exposure done: {len(found)} hit(s).")
 
 if __name__ == "__main__":
     root = tk.Tk()
