@@ -787,6 +787,8 @@ class GhostReconGUI:
         settings.add_separator()
         settings.add_command(label="Install missing tools…",
                              command=self.open_install_dialog)
+        settings.add_command(label="Update installed tools…",
+                             command=self.open_update_dialog)
         settings.add_separator()
         settings.add_command(label="Update nuclei engine…",
                              command=self.update_nuclei_engine)
@@ -1589,8 +1591,8 @@ class GhostReconGUI:
         btn.grid(row=0, column=2, padx=5, pady=5)
         self.run_buttons.append(btn)
 
-        ttk.Checkbutton(tab, text="Also run amass (opt-in: slow, and passive mode "
-                                  "finds little without API keys)",
+        ttk.Checkbutton(tab, text="Also run amass (opt-in: takes several minutes and "
+                                  "mostly overlaps subfinder)",
                         variable=self._amass_var()
                         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5)
 
@@ -2816,6 +2818,442 @@ class GhostReconGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------------------------ #
+    # Settings: update installed tools
+    # ------------------------------------------------------------------ #
+    # Each tool is updated the same way it was installed, detected from where
+    # its binary actually lives -- never by guessing. Mixing methods (e.g.
+    # `go install` over an apt binary) would leave two copies fighting on PATH.
+    #   apt     : dpkg owns the file      -> apt-get install --only-upgrade (pkexec)
+    #   go      : `go version -m` works   -> go install <pkg>@latest
+    #   pipx    : lives in a pipx venv    -> pipx upgrade
+    #   venv    : GhostRecon's shared venv-> venv pip install -U
+    #   git     : GhostRecon git clone    -> git pull --ff-only
+    #   release : trufflehog binary       -> re-download latest release
+    UPDATE_TIMEOUT = 20
+
+    def _sh(self, cmd, timeout=None):
+        """Run a command quietly; return (returncode, stdout+stderr)."""
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout or self.UPDATE_TIMEOUT,
+                               shell=isinstance(cmd, str))
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return 1, str(e)
+
+    def _fetch_json(self, url):
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "GhostRecon-updater",
+                                                   "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.UPDATE_TIMEOUT) as r:
+            return json.loads(r.read().decode())
+
+    @staticmethod
+    def _ver_tuple(v):
+        """Loose numeric version key: 'v3.11.1' / '1.10.8-1' -> (3, 11, 1)."""
+        v = re.sub(r'^[vV]', '', (v or "").strip()).split("-")[0].split("+")[0]
+        return tuple(int(x) for x in re.findall(r'\d+', v)[:4])
+
+    def _newer(self, latest, installed):
+        try:
+            return self._ver_tuple(latest) > self._ver_tuple(installed)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _goproxy_escape(module):
+        # proxy.golang.org case-encodes uppercase letters as '!' + lowercase.
+        return re.sub(r'[A-Z]', lambda m: "!" + m.group(0).lower(), module)
+
+    def _tool_path(self, name):
+        return self.pd_httpx_path() if name == "httpx" else shutil.which(name)
+
+    def _detect_install(self, name):
+        """Work out how `name` was installed and its installed version.
+        Returns a dict: {name, method, path, installed, + method-specific keys}."""
+        path = self._tool_path(name)
+        info = {"name": name, "method": "unknown", "path": path, "installed": "?"}
+        if not path:
+            return None
+        real = os.path.realpath(path)
+        grt = os.path.expanduser(self.GR_TOOLS_DIR)
+        pipx_root = os.path.expanduser("~/.local/share/pipx/venvs") + os.sep
+
+        # GhostRecon git-clone tools: ~/.local/bin/<cmd> is a sh wrapper -> clone dir
+        try:
+            with open(real, "rb") as f:
+                head = f.read(400).decode(errors="replace")
+        except OSError:
+            head = ""
+        # The wrapper names the venv python first, then the clone's entry script.
+        clones = [c for c in re.findall(re.escape(grt) + r'/([^/"]+)/', head)
+                  if c != ".venv"]
+        if head.startswith("#!/bin/sh") and clones:
+            d = os.path.join(grt, clones[0])
+            if os.path.isdir(os.path.join(d, ".git")):
+                rc, out = self._sh(["git", "-C", d, "log", "-1", "--format=%h %cs"])
+                info.update(method="git", dir=d,
+                            installed=out.strip() if rc == 0 else "?")
+                return info
+
+        if real.startswith(pipx_root):
+            venv = real[len(pipx_root):].split(os.sep)[0]
+            rc, out = self._sh(["pipx", "list", "--json"])
+            try:
+                meta = json.loads(out)["venvs"][venv]["metadata"]["main_package"]
+                info.update(method="pipx", venv=venv, pkg=meta["package"],
+                            installed=meta["package_version"])
+            except (ValueError, KeyError):
+                info.update(method="pipx", venv=venv, pkg=venv)
+            return info
+
+        if real.startswith(os.path.join(grt, ".venv") + os.sep):
+            pkg = self.PIP_PKG.get(name, (name, None))[0]
+            rc, out = self._sh([os.path.join(grt, ".venv/bin/pip"), "show", pkg])
+            mv = re.search(r'^Version:\s*(\S+)', out, re.M)
+            info.update(method="venv", pkg=pkg, installed=mv.group(1) if mv else "?")
+            return info
+
+        rc, out = self._sh(["dpkg", "-S", real])
+        if rc == 0 and ":" in out:
+            pkg = out.split(":")[0].strip().split(",")[0]
+            rc, pol = self._sh(["apt-cache", "policy", pkg])
+            mi = re.search(r'Installed:\s*(\S+)', pol)
+            mc = re.search(r'Candidate:\s*(\S+)', pol)
+            info.update(method="apt", pkg=pkg, installed=mi.group(1) if mi else "?",
+                        candidate=mc.group(1) if mc else None)
+            return info
+
+        if self.has_tool("go"):
+            rc, out = self._sh(["go", "version", "-m", real])
+            mp = re.search(r'^\s*path\s+(\S+)', out, re.M)
+            mm = re.search(r'^\s*mod\s+(\S+)\s+(\S+)', out, re.M)
+            if rc == 0 and mp and mm:
+                info.update(method="go", gopkg=mp.group(1), module=mm.group(1),
+                            installed=mm.group(2), bindir=os.path.dirname(real))
+                return info
+
+        if name == "trufflehog":
+            rc, out = self._sh([real, "--version"])
+            mv = re.search(r'(\d+\.\d+\.\d+)', out)
+            info.update(method="release", installed=mv.group(1) if mv else "?")
+        return info
+
+    def _latest_version(self, info):
+        """Fill info['latest'] and info['update'] (True/False/None=unknown)."""
+        m = info["method"]
+        try:
+            if m == "apt":
+                info["latest"] = info.get("candidate") or "?"
+                if info["latest"] in ("?", "(none)"):
+                    info["update"] = None
+                else:
+                    rc, _ = self._sh(["dpkg", "--compare-versions", info["installed"],
+                                      "lt", info["latest"]])
+                    info["update"] = rc == 0
+            elif m == "go":
+                d = self._fetch_json("https://proxy.golang.org/%s/@latest"
+                                     % self._goproxy_escape(info["module"]))
+                info["latest"] = d.get("Version", "?")
+                info["update"] = (None if info["installed"] in ("(devel)", "?")
+                                  else self._newer(info["latest"], info["installed"]))
+            elif m in ("pipx", "venv"):
+                d = self._fetch_json(f"https://pypi.org/pypi/{info['pkg']}/json")
+                info["latest"] = d["info"]["version"]
+                info["update"] = self._newer(info["latest"], info["installed"])
+            elif m == "git":
+                rc, url = self._sh(["git", "-C", info["dir"], "remote", "get-url", "origin"])
+                rc2, out = self._sh(["git", "ls-remote", url.strip(), "HEAD"])
+                remote = out.split()[0][:7] if rc2 == 0 and out.strip() else "?"
+                info["latest"] = remote
+                info["update"] = (None if remote == "?"
+                                  else not info["installed"].startswith(remote))
+            elif m == "release":
+                d = self._fetch_json("https://api.github.com/repos/trufflesecurity/"
+                                     "trufflehog/releases/latest")
+                info["latest"] = d.get("tag_name", "?")
+                info["update"] = self._newer(info["latest"], info["installed"])
+            else:
+                info["latest"], info["update"] = "—", None
+        except Exception as e:   # network / API hiccup: report, don't crash
+            info["latest"], info["update"] = "check failed", None
+            info["error"] = str(e)
+        return info
+
+    def _update_command(self, info):
+        """Shell command that updates one non-apt tool in place (apt is batched)."""
+        m = info["method"]
+        if m == "go":
+            return (f'GOBIN={shlex.quote(info["bindir"])} '
+                    f'go install -v {shlex.quote(info["gopkg"])}@latest')
+        if m == "pipx":
+            return f'pipx upgrade {shlex.quote(info["venv"])}'
+        if m == "venv":
+            pip = os.path.join(os.path.expanduser(self.GR_TOOLS_DIR), ".venv/bin/pip")
+            return f'{shlex.quote(pip)} install -U {shlex.quote(info["pkg"])}'
+        if m == "git":
+            return f'git -C {shlex.quote(info["dir"])} pull --ff-only'
+        if m == "release":
+            return GR_TRUFFLEHOG_INSTALL
+        return None
+
+    @staticmethod
+    def _apt_lists_age():
+        """Days since apt's package lists were last refreshed (None if unknown)."""
+        try:
+            d = "/var/lib/apt/lists"
+            newest = max(os.path.getmtime(os.path.join(d, f)) for f in os.listdir(d)
+                         if f.endswith(("Release", "InRelease", "Packages")))
+            return (time.time() - newest) / 86400
+        except (OSError, ValueError):
+            return None
+
+    def open_update_dialog(self):
+        win = tk.Toplevel(self.master)
+        win.title("Update Installed Tools")
+        win.geometry("900x640")
+        t = THEMES[self.theme_name]
+        win.configure(bg=t["bg"])
+
+        ttk.Label(win, text="Update installed tools",
+                  font=("Helvetica", 14, "bold")).pack(anchor="w", padx=12, pady=(12, 2))
+        ttk.Label(win, wraplength=870, text=(
+            "Each tool is updated the same way it was installed (apt, go, pipx, venv, "
+            "git or release binary). apt updates ask for your password once.")
+                  ).pack(anchor="w", padx=12)
+        age = self._apt_lists_age()
+        apt_note = ttk.Label(win, foreground=t["tab_fg"], wraplength=870, text=(
+            "apt package lists: unknown age" if age is None else
+            f"apt package lists last refreshed {age:.0f} day(s) ago"
+            + (" — stale; apt's 'Latest' may be behind. Updating refreshes them "
+               "first, or use 'Refresh apt lists'." if age > 7 else ".")))
+        apt_note.pack(anchor="w", padx=12, pady=(2, 6))
+
+        wrap = ttk.Frame(win)
+        wrap.pack(fill="both", expand=True, padx=12)
+        cols = ("sel", "tool", "method", "installed", "latest", "status")
+        tree = ttk.Treeview(wrap, columns=cols, show="headings", height=12,
+                            selectmode="none")
+        for col, label, width, anchor in (("sel", "✓", 34, "center"),
+                                          ("tool", "Tool", 110, "w"),
+                                          ("method", "Method", 70, "center"),
+                                          ("installed", "Installed", 190, "w"),
+                                          ("latest", "Latest", 190, "w"),
+                                          ("status", "Status", 150, "w")):
+            tree.heading(col, text=label)
+            tree.column(col, width=width, anchor=anchor, stretch=col in ("installed",
+                                                                        "latest"))
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(wrap, command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree["yscrollcommand"] = sb.set
+        tree.tag_configure("update", foreground="#e67e22")
+        tree.tag_configure("muted", foreground="#888888")
+
+        out = tk.Text(win, height=10, wrap=tk.WORD, state="disabled",
+                      font=("Courier New", 9), bg=t["text_bg"], fg=t["text_fg"],
+                      insertbackground=t["text_fg"], relief=tk.FLAT)
+        out.pack(fill="both", expand=False, padx=12, pady=8)
+
+        btnrow = ttk.Frame(win)
+        btnrow.pack(fill="x", padx=12, pady=(0, 12))
+        check_btn = ttk.Button(btnrow, text="Check for updates")
+        check_btn.pack(side="left")
+        refresh_btn = ttk.Button(btnrow, text="Refresh apt lists")
+        refresh_btn.pack(side="left", padx=6)
+        ttk.Button(btnrow, text="Select all updates",
+                   command=lambda: set_all(True)).pack(side="left")
+        ttk.Button(btnrow, text="Select none",
+                   command=lambda: set_all(False)).pack(side="left", padx=6)
+        update_btn = ttk.Button(btnrow, text="Update selected")
+        update_btn.pack(side="right")
+        ttk.Button(btnrow, text="Close", command=win.destroy).pack(side="right", padx=6)
+
+        infos = {}       # tool -> detected info
+        checked = {}     # tool -> bool
+
+        def ui(fn):
+            win.after(0, lambda: fn() if win.winfo_exists() else None)
+
+        def append(text):
+            def _do():
+                out.config(state="normal")
+                out.insert(tk.END, text)
+                out.see(tk.END)
+                out.config(state="disabled")
+            ui(_do)
+
+        def busy(flag):
+            def _do():
+                for b in (check_btn, refresh_btn, update_btn):
+                    b.config(state=tk.DISABLED if flag else tk.NORMAL)
+            ui(_do)
+
+        def render(name):
+            i = infos[name]
+            upd = i.get("update")
+            status = ("checking…" if "latest" not in i else
+                      "update available" if upd else
+                      "up to date" if upd is False else
+                      (i.get("error", "")[:40] or "can't tell") if i["method"] != "unknown"
+                      else "unmanaged — update manually")
+            mark = "☑" if checked.get(name) else ("☐" if upd else "")
+            vals = (mark, name, i["method"], i["installed"], i.get("latest", "…"), status)
+            tags = ("update",) if upd else (("muted",) if i["method"] == "unknown" else ())
+            if tree.exists(name):
+                tree.item(name, values=vals, tags=tags)
+            else:
+                tree.insert("", tk.END, iid=name, values=vals, tags=tags)
+
+        def on_click(event):
+            if tree.identify("region", event.x, event.y) != "cell":
+                return
+            name = tree.identify_row(event.y)
+            if name and infos.get(name, {}).get("update"):
+                checked[name] = not checked.get(name)
+                render(name)
+        tree.bind("<Button-1>", on_click)
+
+        def set_all(value):
+            for name, i in infos.items():
+                if i.get("update"):
+                    checked[name] = value
+                    render(name)
+
+        def do_check():
+            busy(True)
+            ui(lambda: tree.delete(*tree.get_children()))
+            infos.clear()
+            checked.clear()
+
+            def worker():
+                from concurrent.futures import ThreadPoolExecutor
+                names = [n for n in self.TOOLS if self._tool_path(n)]
+                append(f"Checking {len(names)} installed tools…\n")
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    detected = [d for d in pool.map(self._detect_install, names) if d]
+                for d in detected:
+                    infos[d["name"]] = d
+                    ui(lambda n=d["name"]: render(n))
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    for d in pool.map(self._latest_version, detected):
+                        if d.get("update"):
+                            checked[d["name"]] = True
+                        ui(lambda n=d["name"]: render(n))
+                def sort_rows():   # updates first, then alphabetical
+                    order = sorted(infos, key=lambda n: (not infos[n].get("update"), n))
+                    for idx, n in enumerate(order):
+                        if tree.exists(n):
+                            tree.move(n, "", idx)
+                ui(sort_rows)
+                n_upd = sum(1 for d in detected if d.get("update"))
+                n_fail = [d["name"] for d in detected if d.get("error")]
+                append(f"{n_upd} update(s) available.\n")
+                if n_fail:
+                    append(f"Could not check: {', '.join(n_fail)} (network/API).\n")
+                busy(False)
+                self.update_status(f"Tool update check: {n_upd} update(s) available.")
+            threading.Thread(target=worker, daemon=True).start()
+
+        def stream(cmd):
+            """Run a shell command, streaming output into the dialog log."""
+            try:
+                proc = subprocess.Popen(cmd, shell=isinstance(cmd, str),
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, bufsize=1)
+            except OSError as e:
+                append(f"[!] {e}\n")
+                return 1, ""
+            buf = []
+            for line in proc.stdout:
+                line = strip_ansi(line)
+                buf.append(line)
+                append(line)
+            proc.wait()
+            return proc.returncode, "".join(buf)
+
+        def can_pkexec():
+            return bool(shutil.which("pkexec") and os.environ.get("DISPLAY"))
+
+        def do_refresh_apt():
+            if not can_pkexec():
+                append("\nNo graphical sudo (pkexec) available. In a terminal run:\n"
+                       "    sudo apt-get update\nthen click 'Check for updates'.\n")
+                return
+            busy(True)
+
+            def worker():
+                append("\n=== Refreshing apt package lists (password prompt) ===\n")
+                rc, _ = stream(["pkexec", "apt-get", "update"])
+                if rc in (126, 127):
+                    append("[!] Authentication cancelled or denied.\n")
+                busy(False)
+                if rc == 0:
+                    ui(lambda: apt_note.config(
+                        text="apt package lists refreshed just now."))
+                    ui(do_check)
+            threading.Thread(target=worker, daemon=True).start()
+
+        def do_update():
+            chosen = [infos[n] for n, on in checked.items() if on]
+            if not chosen:
+                append("\nNothing selected — tick tools marked 'update available'.\n")
+                return
+            busy(True)
+
+            def worker():
+                apt_pkgs = sorted({i["pkg"] for i in chosen if i["method"] == "apt"})
+                others = [i for i in chosen if i["method"] != "apt"]
+                results = {}
+                if apt_pkgs:
+                    pk = " ".join(shlex.quote(p) for p in apt_pkgs)
+                    inner = f"apt-get update && apt-get install -y --only-upgrade {pk}"
+                    if can_pkexec():
+                        append(f"\n=== apt: upgrading {', '.join(apt_pkgs)} "
+                               "(password prompt) ===\n")
+                        rc, _ = stream(["pkexec", "sh", "-c", inner])
+                        if rc in (126, 127):
+                            append("[!] Authentication cancelled or denied.\n")
+                    else:
+                        rc = 1
+                        append("\nNo graphical sudo (pkexec). In a terminal run:\n"
+                               f"    sudo sh -c '{inner}'\n")
+                    for i in chosen:
+                        if i["method"] == "apt":
+                            results[i["name"]] = rc == 0
+                for i in others:
+                    cmd = self._update_command(i)
+                    append(f"\n=== {i['name']} ({i['method']}) ===\n$ {cmd}\n")
+                    rc, log = stream(cmd)
+                    if rc != 0 and i["method"] == "go":
+                        # Reuse the installer's diagnosis (e.g. module needs newer Go).
+                        diag = self._diagnose_install(i["name"], "go", cmd, log)
+                        if diag.get("pre"):
+                            append(f"    ↳ {diag['why']}\n")
+                            stream(diag["pre"])
+                            gb = self._go_bin_dir()
+                            os.environ["PATH"] = gb + os.pathsep + os.environ["PATH"]
+                            rc, _ = stream(cmd)
+                    results[i["name"]] = rc == 0
+                append("\n=== Re-checking versions ===\n")
+                for name in results:
+                    fresh = self._detect_install(name)
+                    if fresh:
+                        infos[name] = self._latest_version(fresh)
+                    checked[name] = False
+                    ui(lambda n=name: render(n))
+                    append(f"{'[OK]' if results[name] else '[FAILED]'} {name}: "
+                           f"now {infos[name]['installed']}\n")
+                busy(False)
+                self.update_status("Tool updates finished.")
+            threading.Thread(target=worker, daemon=True).start()
+
+        check_btn.config(command=do_check)
+        refresh_btn.config(command=do_refresh_apt)
+        update_btn.config(command=do_update)
+        do_check()
+
+    # ------------------------------------------------------------------ #
     # Stage 1: Subdomains
     # ------------------------------------------------------------------ #
     # ------------------------------------------------------------------ #
@@ -3014,15 +3452,28 @@ class GhostReconGUI:
         if not self._amass_var().get():
             pass   # amass is opt-in; skipped silently by default
         elif self.has_tool("amass"):
-            self.update_status("Running amass (passive) ...")
+            self.update_status("Running amass (passive, can take a few minutes) ...")
             out = os.path.join(outdir, "amass.txt")
-            # amass v4+/v5: no -o flag. Names print to stdout; progress goes to
-            # stderr (dropped via merge_stderr=False); -dir holds its DB.
-            lines = self.run_stream(
-                ["amass", "enum", "-passive", "-d", domain,
-                 "-dir", outdir, "-timeout", "10"], w, merge_stderr=False)
+            # amass v5 quirks (verified on v5.1.1):
+            #  * `enum` does NOT print discovered names — it only fills amass's
+            #    graph DB (~/.config/amass). Names are read back with `amass subs`.
+            #  * Do NOT pass -dir: the client hands work to a shared background
+            #    engine, and with a custom -dir the session ends in ~10s with
+            #    only the apex. Use the default DB.
+            #  * enum's stdout is a \r progress bar (one "line" per tick), so it
+            #    is swallowed rather than streamed into the log.
+            self.append(w, f"$ amass enum -passive -d {domain} -timeout 10  "
+                           "(progress hidden)\n")
+            self.run_stream(["amass", "enum", "-passive", "-d", domain, "-timeout", "10"],
+                            w, merge_stderr=False, echo=False, on_line=lambda _l: None)
+            if self.stop_requested:
+                return
+            lines = self.run_stream(["amass", "subs", "-names", "-d", domain],
+                                    w, merge_stderr=False, echo=False,
+                                    on_line=None)
             names = {ln.strip().lower() for ln in lines
-                     if ln.strip() and ln.strip().endswith(domain)}
+                     if ln.strip() and (ln.strip().lower() == domain
+                                        or ln.strip().lower().endswith("." + domain))}
             with open(out, "w") as f:
                 f.write("\n".join(sorted(names)) + ("\n" if names else ""))
             self.append(w, f"[+] amass: {len(names)} names -> {out}\n")
