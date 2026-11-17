@@ -28,6 +28,7 @@ import random
 import string
 import time
 import shlex
+import sqlite3
 from urllib.parse import urlsplit, parse_qsl, quote, urlencode
 
 try:
@@ -511,6 +512,7 @@ class GhostReconGUI:
     def show_main_screen(self):
         self.welcome_frame.destroy()
         self.create_main_widgets()
+        self.master.protocol("WM_DELETE_WINDOW", self._on_close)
         self.apply_theme()
         self.check_dependencies(initial=True)
 
@@ -806,6 +808,7 @@ class GhostReconGUI:
 
         self.outputs = {}  # tab name -> Text widget (order must match tab order)
         self._build_scope_tab()
+        self._build_notes_tab()
         self._build_oneshot_tab()
         self._build_subdomain_tab()
         self._build_livehost_tab()
@@ -961,6 +964,7 @@ class GhostReconGUI:
                     f"{len(entries) - n_in} out) from {path}\n")
         self._scope_populate()
         self.update_status(f"Scope loaded: {n_in} in-scope targets")
+        self._notes_sync_scope(path, entries)
 
     def _scope_populate(self):
         tree = self.scope_tree
@@ -1038,8 +1042,423 @@ class GhostReconGUI:
             widget.insert(0, plain[0])
             msg = f"'{plain[0]}'" + (f" (+{len(plain) - 1} more ignored; "
                                      "this stage takes one)" if len(plain) > 1 else "")
-        self.notebook.select(self.STAGE_TARGETS.index(dest) + 1)  # +1 past Scope tab
+        self._select_tab(dest)
         self.update_status(f"Sent {msg} to {dest}")
+
+    def _select_tab(self, label):
+        """Select a top-level tab by its label (robust to tabs being added/reordered)."""
+        for tab_id in self.notebook.tabs():
+            if self.notebook.tab(tab_id, "text") == label:
+                self.notebook.select(tab_id)
+                return
+
+    # --- Tab: Notes — per-asset notebook backed by SQLite ------------------ #
+    # Every scope asset (auto-imported when a scope file loads) plus anything
+    # added by hand gets a row; each row carries a status, tags and free-form
+    # notes. Stored in ~/.config/ghostrecon/notes.db so notes survive restarts
+    # and accumulate across sessions. Only touched from the Tk main thread.
+    NOTE_STATUSES = ["untested", "in progress", "interesting", "finding",
+                     "reported", "done", "ignore"]
+
+    @staticmethod
+    def _notes_db_path():
+        return os.path.expanduser("~/.config/ghostrecon/notes.db")
+
+    def _notes_db(self):
+        if getattr(self, "_notes_conn", None) is None:
+            path = self._notes_db_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fresh = not os.path.exists(path)
+            self._notes_conn = sqlite3.connect(path)
+            self._notes_conn.execute("""
+                CREATE TABLE IF NOT EXISTS assets (
+                    id      INTEGER PRIMARY KEY,
+                    program TEXT NOT NULL,
+                    host    TEXT NOT NULL,
+                    scope   TEXT NOT NULL DEFAULT 'manual',
+                    status  TEXT NOT NULL DEFAULT 'untested',
+                    tags    TEXT NOT NULL DEFAULT '',
+                    notes   TEXT NOT NULL DEFAULT '',
+                    created TEXT NOT NULL,
+                    updated TEXT NOT NULL,
+                    UNIQUE(program, host))""")
+            self._notes_conn.commit()
+            if fresh:
+                os.chmod(path, 0o600)   # notes may hold creds/tokens found in testing
+        return self._notes_conn
+
+    @staticmethod
+    def _now():
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    def _build_notes_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="Notes")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        self._notes_current = None      # asset id shown in the editor
+        self._notes_save_job = None     # pending debounced autosave
+
+        ctl = ttk.Frame(tab)
+        ctl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(ctl, text="Program:").pack(side="left")
+        self.notes_program = ttk.Combobox(ctl, state="readonly", width=24)
+        self.notes_program.pack(side="left", padx=4)
+        self.notes_program.bind("<<ComboboxSelected>>", lambda e: self._notes_refresh())
+        ttk.Label(ctl, text="  Status:").pack(side="left")
+        self.notes_status_filter = ttk.Combobox(ctl, state="readonly", width=12,
+                                                values=["all"] + self.NOTE_STATUSES)
+        self.notes_status_filter.set("all")
+        self.notes_status_filter.pack(side="left", padx=4)
+        self.notes_status_filter.bind("<<ComboboxSelected>>",
+                                      lambda e: self._notes_refresh())
+        ttk.Label(ctl, text="  Search:").pack(side="left")
+        self.notes_search = tk.StringVar()
+        self.notes_search.trace_add("write", lambda *a: self._notes_refresh())
+        ttk.Entry(ctl, textvariable=self.notes_search, width=24).pack(side="left", padx=4)
+        ttk.Label(ctl, text="(host, tags or note text)", foreground="#888"
+                  ).pack(side="left")
+
+        pane = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        pane.grid(row=1, column=0, sticky="nsew")
+
+        # Left: asset list
+        left = ttk.Frame(pane)
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        cols = ("host", "scope", "status", "n", "updated")
+        self.notes_tree = ttk.Treeview(left, columns=cols, show="headings",
+                                       selectmode="browse")
+        for col, label, width, stretch in (("host", "Asset", 220, True),
+                                           ("scope", "Scope", 60, False),
+                                           ("status", "Status", 90, False),
+                                           ("n", "📝", 30, False),
+                                           ("updated", "Updated", 130, False)):
+            self.notes_tree.heading(col, text=label)
+            self.notes_tree.column(col, width=width, stretch=stretch,
+                                   anchor="w" if col == "host" else "center")
+        self.notes_tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(left, command=self.notes_tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.notes_tree["yscrollcommand"] = sb.set
+        self.notes_tree.tag_configure("out", foreground="#c0392b")
+        self.notes_tree.tag_configure("finding", foreground="#e67e22")
+        self.notes_tree.bind("<<TreeviewSelect>>", self._notes_on_select)
+
+        btns = ttk.Frame(left)
+        btns.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(btns, text="Add asset…", command=self._notes_add_dialog
+                   ).pack(side="left")
+        ttk.Button(btns, text="Import found subs",
+                   command=self._notes_import_discovered).pack(side="left", padx=4)
+        ttk.Button(btns, text="Delete", command=self._notes_delete).pack(side="left")
+        ttk.Button(btns, text="Export .md…", command=self._notes_export
+                   ).pack(side="right")
+        pane.add(left, weight=1)
+
+        # Right: editor for the selected asset
+        right = ttk.Frame(pane, padding=(10, 0, 0, 0))
+        right.columnconfigure(1, weight=1)
+        right.rowconfigure(3, weight=1)
+        self.notes_title = ttk.Label(right, text="Select an asset",
+                                     font=("Helvetica", 13, "bold"))
+        self.notes_title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Label(right, text="Status:").grid(row=1, column=0, sticky="w")
+        self.notes_status = ttk.Combobox(right, state="disabled", width=14,
+                                         values=self.NOTE_STATUSES)
+        self.notes_status.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        self.notes_status.bind("<<ComboboxSelected>>", lambda e: self._notes_save())
+        ttk.Label(right, text="Tags:").grid(row=2, column=0, sticky="w")
+        self.notes_tags = ttk.Entry(right, state="disabled")
+        self.notes_tags.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=2)
+        self.notes_tags.bind("<KeyRelease>", lambda e: self._notes_schedule_save())
+
+        self.notes_text = tk.Text(right, wrap=tk.WORD, undo=True, state="disabled",
+                                  font=("Courier New", 10), relief=tk.FLAT, bd=0)
+        self.notes_text.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+        nsb = ttk.Scrollbar(right, command=self.notes_text.yview)
+        nsb.grid(row=3, column=3, sticky="ns", pady=(6, 0))
+        self.notes_text["yscrollcommand"] = nsb.set
+        self.notes_text.bind("<KeyRelease>", lambda e: self._notes_schedule_save())
+        self.notes_text.bind("<Control-s>", lambda e: (self._notes_save(), "break")[1])
+
+        foot = ttk.Frame(right)
+        foot.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Button(foot, text="Insert timestamp",
+                   command=self._notes_insert_timestamp).pack(side="left")
+        self.notes_saved = ttk.Label(foot, text="", foreground="#888")
+        self.notes_saved.pack(side="right")
+        pane.add(right, weight=2)
+
+        self._notes_refresh()
+
+    # Data access ---------------------------------------------------------- #
+    def _notes_upsert(self, program, host, scope):
+        """Insert an asset if new; refresh its scope label if it already exists.
+        Never touches existing notes/status. Returns True if a row was added."""
+        db, now = self._notes_db(), self._now()
+        cur = db.execute("INSERT OR IGNORE INTO assets(program, host, scope, created, "
+                         "updated) VALUES (?,?,?,?,?)", (program, host, scope, now, now))
+        if not cur.rowcount and scope != "manual":
+            db.execute("UPDATE assets SET scope=? WHERE program=? AND host=?",
+                       (scope, program, host))
+        return bool(cur.rowcount)
+
+    def _notes_program_name(self):
+        """Program for new assets: the selected one, else the loaded scope file's
+        name, else 'default'."""
+        sel = self.notes_program.get()
+        if sel and sel != "All programs":
+            return sel
+        if self.scope.get("file"):
+            return os.path.splitext(os.path.basename(self.scope["file"]))[0]
+        return "default"
+
+    def _notes_sync_scope(self, path, entries):
+        program = os.path.splitext(os.path.basename(path))[0]
+        added = sum(self._notes_upsert(program, e["host"], e["scope"]) for e in entries)
+        self._notes_db().commit()
+        self._notes_refresh(program=program)
+        self.append(self.outputs["scope"],
+                    f"[+] Notes: {added} new asset(s) added under program '{program}'\n")
+
+    def _notes_refresh(self, program=None):
+        if not hasattr(self, "notes_tree"):
+            return
+        db = self._notes_db()
+        programs = [r[0] for r in db.execute(
+            "SELECT DISTINCT program FROM assets ORDER BY program")]
+        self.notes_program["values"] = ["All programs"] + programs
+        if program:
+            self.notes_program.set(program)
+        elif self.notes_program.get() not in self.notes_program["values"]:
+            self.notes_program.set("All programs")
+
+        sql, args = "SELECT id, program, host, scope, status, notes, updated " \
+                    "FROM assets WHERE 1=1", []
+        prog = self.notes_program.get()
+        if prog != "All programs":
+            sql += " AND program=?"
+            args.append(prog)
+        st = self.notes_status_filter.get()
+        if st and st != "all":
+            sql += " AND status=?"
+            args.append(st)
+        needle = self.notes_search.get().strip()
+        if needle:
+            sql += " AND (host LIKE ? OR tags LIKE ? OR notes LIKE ?)"
+            args += [f"%{needle}%"] * 3
+        sql += " ORDER BY program, scope, host"
+
+        tree = self.notes_tree
+        tree.delete(*tree.get_children())
+        show_prog = prog == "All programs" and len(programs) > 1
+        for aid, p, host, scope, status, notes, updated in db.execute(sql, args):
+            tags = ("out",) if scope == "out" else \
+                   ("finding",) if status in ("finding", "reported") else ()
+            label = f"{host}   [{p}]" if show_prog else host
+            tree.insert("", tk.END, iid=str(aid), tags=tags,
+                        values=(label, scope, status, "•" if notes.strip() else "",
+                                updated))
+        if self._notes_current is not None and tree.exists(str(self._notes_current)):
+            tree.selection_set(str(self._notes_current))
+            tree.see(str(self._notes_current))
+
+    # Editor --------------------------------------------------------------- #
+    def _notes_on_select(self, _event=None):
+        sel = self.notes_tree.selection()
+        if not sel or int(sel[0]) == self._notes_current:
+            return
+        self._notes_save()                      # flush the asset we're leaving
+        row = self._notes_db().execute(
+            "SELECT program, host, scope, status, tags, notes, updated FROM assets "
+            "WHERE id=?", (int(sel[0]),)).fetchone()
+        if not row:
+            return
+        program, host, scope, status, tags, notes, updated = row
+        self._notes_current = int(sel[0])
+        self.notes_title.config(text=f"{host}   ·   {program}   ·   {scope}-scope"
+                                if scope in ("in", "out") else f"{host}   ·   {program}")
+        self.notes_status.config(state="readonly")
+        self.notes_status.set(status)
+        self.notes_tags.config(state="normal")
+        self.notes_tags.delete(0, tk.END)
+        self.notes_tags.insert(0, tags)
+        self.notes_text.config(state="normal")
+        self.notes_text.delete("1.0", tk.END)
+        self.notes_text.insert("1.0", notes)
+        self.notes_text.edit_reset()
+        self.notes_saved.config(text=f"Last saved {updated}")
+
+    def _notes_schedule_save(self):
+        if self._notes_save_job:
+            self.master.after_cancel(self._notes_save_job)
+        self.notes_saved.config(text="Editing…")
+        self._notes_save_job = self.master.after(800, self._notes_save)
+
+    def _notes_save(self):
+        if self._notes_save_job:
+            self.master.after_cancel(self._notes_save_job)
+            self._notes_save_job = None
+        if self._notes_current is None:
+            return
+        db = self._notes_db()
+        new = (self.notes_status.get() or "untested", self.notes_tags.get().strip(),
+               self.notes_text.get("1.0", "end-1c"))
+        old = db.execute("SELECT status, tags, notes FROM assets WHERE id=?",
+                         (self._notes_current,)).fetchone()
+        if old is None or tuple(old) == new:
+            return
+        now = self._now()
+        db.execute("UPDATE assets SET status=?, tags=?, notes=?, updated=? WHERE id=?",
+                   (*new, now, self._notes_current))
+        db.commit()
+        self.notes_saved.config(text=f"Saved {now}")
+        iid = str(self._notes_current)
+        if self.notes_tree.exists(iid):
+            self.notes_tree.set(iid, "status", new[0])
+            self.notes_tree.set(iid, "n", "•" if new[2].strip() else "")
+            self.notes_tree.set(iid, "updated", now)
+
+    def _on_close(self):
+        """Flush any pending note edit before the window goes away."""
+        try:
+            self._notes_save()
+            if getattr(self, "_notes_conn", None) is not None:
+                self._notes_conn.close()
+        except Exception:
+            pass
+        self.master.destroy()
+
+    def _notes_insert_timestamp(self):
+        if self._notes_current is None:
+            return
+        self.notes_text.insert(tk.INSERT, f"[{self._now()}] ")
+        self.notes_text.focus_set()
+        self._notes_schedule_save()
+
+    def _notes_clear_editor(self):
+        self._notes_current = None
+        self.notes_title.config(text="Select an asset")
+        self.notes_status.set("")
+        self.notes_status.config(state="disabled")
+        self.notes_tags.delete(0, tk.END)
+        self.notes_tags.config(state="disabled")
+        self.notes_text.delete("1.0", tk.END)
+        self.notes_text.config(state="disabled")
+        self.notes_saved.config(text="")
+
+    # Actions -------------------------------------------------------------- #
+    def _notes_add_dialog(self):
+        win = tk.Toplevel(self.master)
+        win.title("Add asset")
+        win.configure(bg=THEMES[self.theme_name]["bg"])
+        win.transient(self.master)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+        ttk.Label(frm, text="Program:").grid(row=0, column=0, sticky="w")
+        prog = ttk.Combobox(frm, width=30,
+                            values=[v for v in self.notes_program["values"]
+                                    if v != "All programs"])
+        prog.set(self._notes_program_name())
+        prog.grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(frm, text="Assets (one per line —\nhost, wildcard, URL or IP):"
+                  ).grid(row=1, column=0, sticky="nw")
+        box = tk.Text(frm, width=44, height=8, font=("Courier New", 10))
+        t = THEMES[self.theme_name]
+        box.configure(bg=t["text_bg"], fg=t["text_fg"], insertbackground=t["text_fg"])
+        box.grid(row=1, column=1, sticky="nsew", pady=3)
+        box.focus_set()
+
+        def _add():
+            program = prog.get().strip() or "default"
+            hosts = [h.strip().lower() for h in box.get("1.0", tk.END).splitlines()
+                     if h.strip()]
+            added = 0
+            for h in hosts:
+                bare = re.sub(r'^https?://', '', h).split("/")[0]
+                scope = "manual"
+                if self.scope["in_pats"]:
+                    scope = "in" if self.in_scope(bare.split(":")[0].lstrip("*.")) \
+                        else "out"
+                added += self._notes_upsert(program, bare, scope)
+            self._notes_db().commit()
+            win.destroy()
+            self._notes_refresh(program=program)
+            self.update_status(f"Notes: added {added} asset(s) to '{program}'")
+
+        ttk.Button(frm, text="Add", command=_add).grid(row=2, column=1, sticky="e",
+                                                       pady=(8, 0))
+
+    def _notes_import_discovered(self):
+        subs = self.state.get("subdomains") or []
+        if not subs:
+            messagebox.showinfo("Notes", "No discovered subdomains yet — run "
+                                         "1. Subdomains (or One-Stop) first.")
+            return
+        program = self._notes_program_name()
+        added = skipped = 0
+        for h in subs:
+            if self.scope["in_pats"] and not self.in_scope(h):
+                skipped += 1
+                continue
+            scope = "in" if self.scope["in_pats"] else "manual"
+            added += self._notes_upsert(program, h.lower(), scope)
+        self._notes_db().commit()
+        self._notes_refresh(program=program)
+        msg = f"Added {added} new subdomain(s) to '{program}'"
+        if skipped:
+            msg += f"; skipped {skipped} out-of-scope"
+        messagebox.showinfo("Notes", msg + ".")
+
+    def _notes_delete(self):
+        if self._notes_current is None:
+            return
+        host = self.notes_tree.set(str(self._notes_current), "host")
+        if not messagebox.askyesno("Notes", f"Delete '{host}' and all its notes?"):
+            return
+        db = self._notes_db()
+        db.execute("DELETE FROM assets WHERE id=?", (self._notes_current,))
+        db.commit()
+        self._notes_clear_editor()
+        self._notes_refresh()
+
+    def _notes_export(self):
+        self._notes_save()
+        prog = self.notes_program.get()
+        path = filedialog.asksaveasfilename(
+            title="Export notes", defaultextension=".md",
+            initialfile=f"ghostrecon-notes-{prog.replace(' ', '_')}.md",
+            filetypes=[("Markdown", "*.md"), ("All files", "*.*")])
+        if not path:
+            return
+        sql, args = ("SELECT program, host, scope, status, tags, notes, updated "
+                     "FROM assets"), []
+        if prog != "All programs":
+            sql += " WHERE program=?"
+            args.append(prog)
+        sql += " ORDER BY program, scope, host"
+        out, last_prog = [f"# GhostRecon notes — {prog}\n",
+                          f"_Exported {self._now()}_\n"], None
+        for p, host, scope, status, tags, notes, updated in \
+                self._notes_db().execute(sql, args):
+            if p != last_prog:
+                out.append(f"\n## {p}\n")
+                last_prog = p
+            meta = f"scope: {scope} · status: {status} · updated: {updated}"
+            if tags:
+                meta += f" · tags: {tags}"
+            out.append(f"\n### {host}\n\n{meta}\n")
+            if notes.strip():
+                out.append(f"\n{notes.rstrip()}\n")
+        try:
+            with open(path, "w") as f:
+                f.write("".join(out))
+        except OSError as e:
+            messagebox.showerror("Notes", f"Could not write {path}:\n{e}")
+            return
+        self.update_status(f"Notes exported to {path}")
 
     # Scope enforcement used by the active stages --------------------------- #
     def in_scope(self, host):
@@ -1634,7 +2053,7 @@ class GhostReconGUI:
         extra_inputs = [getattr(self, a, None) for a in (
             "hosts_input", "vuln_input", "dirbust_input", "live_feed",
             "js_input", "takeover_input", "params_input", "bypass_input",
-            "nikto_input", "api_input")]
+            "nikto_input", "api_input", "notes_text")]
         for widget in list(getattr(self, "outputs", {}).values()) + extra_inputs:
             if widget is not None:
                 widget.configure(bg=t["text_bg"], fg=t["text_fg"],
@@ -1655,6 +2074,8 @@ class GhostReconGUI:
         self.master.after(0, _do)
 
     def clear_active_output(self):
+        if self._on_notes_tab():
+            return   # never wipe notes from the generic Clear button
         w = self._active_widget()
         if w:
             w.config(state="normal")
@@ -1689,7 +2110,15 @@ class GhostReconGUI:
                 return found
         return None
 
+    def _on_notes_tab(self):
+        try:
+            return self.notebook.tab(self.notebook.select(), "text") == "Notes"
+        except tk.TclError:
+            return False
+
     def save_active_output(self):
+        if self._on_notes_tab():
+            return self._notes_export()
         w = self._active_widget()
         content = w.get("1.0", tk.END).strip()
         if not content:
