@@ -1076,7 +1076,7 @@ class GhostReconGUI:
     # (key, label, default-on). Heavy / intrusive / setup-needing stages
     # default OFF; core recon + quick passive checks default ON.
     ONESHOT_STAGES = [
-        ("subdomains",   "Subdomains (amass · subfinder · crt.sh)", True),
+        ("subdomains",   "Subdomains (subfinder · subfaster · crt.sh)", True),
         ("livehosts",    "Live hosts (httpx)",                      True),
         ("urls",         "URLs & patterns (gau · katana · gf · uro)", True),
         ("ports",        "Port scan (naabu / nmap)",                True),
@@ -1145,6 +1145,8 @@ class GhostReconGUI:
         self.os_maxhosts = tk.IntVar(value=10)
         ttk.Spinbox(ctl, from_=1, to=500, width=5, textvariable=self.os_maxhosts
                     ).pack(side="left", padx=4)
+        ttk.Checkbutton(ctl, text="Also run amass (slow; opt-in)",
+                        variable=self._amass_var()).pack(side="left", padx=(16, 0))
 
         self.ro_output = self._make_output(tab)
 
@@ -1163,12 +1165,23 @@ class GhostReconGUI:
         self.domain_entry.bind("<Return>", lambda e: self.start_subdomain_recon())
         tab.columnconfigure(1, weight=1)
 
-        btn = ttk.Button(tab, text="Enumerate (amass, subfinder, crt.sh, crt.name)",
+        btn = ttk.Button(tab, text="Enumerate (subfinder, subfaster, crt.sh, crt.name)",
                          command=self.start_subdomain_recon)
         btn.grid(row=0, column=2, padx=5, pady=5)
         self.run_buttons.append(btn)
 
+        ttk.Checkbutton(tab, text="Also run amass (opt-in: slow, and passive mode "
+                                  "finds little without API keys)",
+                        variable=self._amass_var()
+                        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5)
+
         self.outputs["sub"] = self._make_output(tab)
+
+    def _amass_var(self):
+        """Shared opt-in toggle for amass (Subdomains tab + One-Stop). Off by default."""
+        if not hasattr(self, "use_amass"):
+            self.use_amass = tk.BooleanVar(value=False)
+        return self.use_amass
 
     # --- Tab: Live Hosts -------------------------------------------------- #
     def _build_livehost_tab(self):
@@ -1867,7 +1880,7 @@ class GhostReconGUI:
         "trufflehog": ("pip", GR_TRUFFLEHOG_INSTALL),
     }
     # Tools that are optional enhancers: never block a stage, just improve it.
-    OPTIONAL_TOOLS = {"jsluice", "subzy", "x8", "js-beautify", "kr"}
+    OPTIONAL_TOOLS = {"jsluice", "subzy", "x8", "js-beautify", "kr", "amass"}
 
     def has_tool(self, name):
         # httpx is special: the name collides with the Python httpx HTTP client.
@@ -2113,7 +2126,10 @@ class GhostReconGUI:
             self._install_vars[name] = (var, method, cmd)
             cb = ttk.Checkbutton(row, variable=var, text=f"{name}")
             cb.pack(side="left")
-            if method == "apt":
+            if name == "amass":
+                hint = "opt-in only — " + ("needs sudo — run in a terminal"
+                                           if method == "apt" else cmd)
+            elif method == "apt":
                 hint = "needs sudo — run in a terminal"
             elif method == "go" and not have_go:
                 hint = "needs Go (fetched automatically)"
@@ -2566,7 +2582,9 @@ class GhostReconGUI:
         self.append(w, f"--- Subdomain enumeration: {domain} ---\n")
         found = set()
 
-        if self.has_tool("amass"):
+        if not self._amass_var().get():
+            pass   # amass is opt-in; skipped silently by default
+        elif self.has_tool("amass"):
             self.update_status("Running amass (passive) ...")
             out = os.path.join(outdir, "amass.txt")
             # amass v4+/v5: no -o flag. Names print to stdout; progress goes to

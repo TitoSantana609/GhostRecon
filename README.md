@@ -10,7 +10,7 @@ A GUI reconnaissance toolkit by [@TitoSantana00](https://github.com/TitoSantana6
           ┌─ Scope (load .txt/.csv/.json, tick targets, enforce everywhere)
           ▼
 1. Subdomains ──> 2. Live Hosts ──┬──> 4. Ports (naabu / nmap)
-   (amass, subfinder,  (httpx:       ├──> 5. Vulnerabilities (nuclei)
+   (subfinder,         (httpx:       ├──> 5. Vulnerabilities (nuclei)
     subfaster,          alive +      ├──> 6. Dir Busting (dirb + ffuf, merged results)
     crt.sh / crt.name)  title + tech)├──> 3. URLs (gau + waybackurls + katana) ─> gf ─> uro
                                      │
@@ -26,7 +26,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
 - **Scope management (first tab)** — load a program's scope from a **`.txt`, `.csv` or `.json`** file (including HackerOne-style exports with `identifier` / `eligible_for_submission` columns, and `{in_scope: […], out_of_scope: […]}` JSON). GhostRecon reduces each entry to a scannable host/wildcard, drops app package IDs and non-web assets, and shows them in a **checklist**: tick exactly the targets you want to test (one at a time or in batches — out-of-scope rows are locked), then **Send checked to** any stage. With **Enforce scope** on (default), every active stage silently drops out-of-scope targets and logs it, so you can't wander outside the program.
 - **Global request settings (Settings menu)** — one place to set an upstream **Burp/HTTP(S)/SOCKS proxy** (so httpx, katana, nuclei, ffuf, naabu, dnsx, wpscan and nikto all show up in Burp's history), **custom headers**, a **cookie**, an optional **bug-bounty identification header** (e.g. `X-Bug-Bounty: <your-handle>`), a **browser User-Agent**, and a **global max requests/sec**. Saved to `~/.config/ghostrecon/settings.json` (chmod 600) and reused on every run.
 - **Out-of-band / OAST callback server** — in the same settings dialog, point OAST at your **own interactsh server** (`-iserver`) with its **token** (`-itoken`), as some programs require (e.g. a self-hosted `interact.sh`), and nuclei uses it automatically. A free-form **callback host** field (with a **Copy** button) holds your Collaborator/payload domain for manual out-of-band payloads. A **Disable OAST** toggle (`nuclei -ni`) is there for programs that forbid out-of-band testing.
-- **Subdomain enumeration** from `amass` (passive), `subfinder`, `subfaster`, and `crt.sh` (JSON API), with `crt.name` as a no-install fallback.
+- **Subdomain enumeration** from `subfinder`, `subfaster`, and `crt.sh` (JSON API), with `crt.name` as a no-install fallback. `amass` is **opt-in** via an "Also run amass" checkbox (Subdomains tab and One-Stop) — it's slow, and amass v5's passive mode returns little without configured API keys.
 - **Live host probing** with `httpx` (status code, page title, tech detection).
 - **URL discovery** from `gau`, `waybackurls`, and `katana`, merged and deduped, then filtered through a chosen **`gf` pattern** (xss, ssrf, lfi, sqli, redirect, rce, idor, ssti) and cleaned with `uro`.
 - **Port scanning** via `naabu` (fast) or `nmap` (`-sV`).
@@ -59,7 +59,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
 
 | Tool | Install |
 |------|---------|
-| amass | `sudo apt install amass` |
+| amass *(optional, opt-in)* | `sudo apt install amass` |
 | subfinder | `go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest` |
 | subfaster | `go install -v github.com/melvinsh/subfaster/v2/cmd/subfaster@latest` |
 | httpx | `go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest` (see note) |
