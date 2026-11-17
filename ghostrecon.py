@@ -1325,6 +1325,10 @@ class GhostReconGUI:
     def _on_close(self):
         """Flush any pending note edit before the window goes away."""
         try:
+            self._stop_shots_server()
+        except Exception:
+            pass
+        try:
             self._notes_save()
             if getattr(self, "_notes_conn", None) is not None:
                 self._notes_conn.close()
@@ -1508,6 +1512,7 @@ class GhostReconGUI:
         ("crlf",         "CRLF injection (crlfuzz)",                True),
         ("openredirect", "Open redirect (OpenRedireX)",             True),
         ("exposure",     "Exposed files (.env · .git · backups)",   True),
+        ("screenshots",  "Screenshots (gowitness)",                 False),
         ("dirbust",      "Directory busting (dirb / ffuf)",         False),
         ("params",       "Parameter discovery (arjun)",             False),
         ("bypass",       "403 / 401 bypass",                        False),
@@ -2055,7 +2060,7 @@ class GhostReconGUI:
         extra_inputs = [getattr(self, a, None) for a in (
             "hosts_input", "vuln_input", "dirbust_input", "live_feed",
             "js_input", "takeover_input", "params_input", "bypass_input",
-            "nikto_input", "api_input", "notes_text")]
+            "nikto_input", "api_input", "notes_text", "shots_input")]
         for widget in list(getattr(self, "outputs", {}).values()) + extra_inputs:
             if widget is not None:
                 widget.configure(bg=t["text_bg"], fg=t["text_fg"],
@@ -2266,6 +2271,7 @@ class GhostReconGUI:
         "openredirex": "https://github.com/devanshbatham/OpenRedireX",
         "gitleaks": "https://github.com/gitleaks/gitleaks",
         "trufflehog": "https://github.com/trufflesecurity/trufflehog",
+        "gowitness": "https://github.com/sensepost/gowitness",
     }
 
     # How to install each tool. "go"/"pip" entries run without sudo; "apt" needs sudo.
@@ -2298,6 +2304,7 @@ class GhostReconGUI:
         "dalfox":    ("go", "go install github.com/hahwul/dalfox/v2@latest"),
         "crlfuzz":   ("go", "go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest"),
         "gitleaks":  ("go", "go install github.com/zricethezav/gitleaks/v8@latest"),
+        "gowitness": ("go", "go install github.com/sensepost/gowitness@latest"),
         # Python git-clone tools: clone into a shared dir + venv, then drop a
         # PATH wrapper in ~/.local/bin so `which` finds them.
         "corsy":     ("pip", GR_PYTOOL_INSTALL.format(
@@ -3426,6 +3433,8 @@ class GhostReconGUI:
             self.run_params((param_urls or live_urls)[:lim] or [target_url])
         elif key == "bypass":
             self.run_bypass(web[:lim])
+        elif key == "screenshots":
+            self.run_screenshots((live_urls or [target_url])[:max(lim, 50)])
         elif key == "nikto":
             self.run_nikto(web[:min(lim, 3)])   # nikto is slow; cap hard
         elif key == "ssrf":
@@ -4046,6 +4055,7 @@ class GhostReconGUI:
         self._build_params_subtab(inner)
         self._build_vhost_subtab(inner)
         self._build_api_subtab(inner)
+        self._build_screenshots_subtab(inner)
 
     # --- JS & Secrets ----------------------------------------------------- #
     def _build_js_subtab(self, nb):
@@ -4933,6 +4943,224 @@ class GhostReconGUI:
             self.run_stream(cmd, w)
         self.append(w, f"\n[+] Nikto done -> {outdir}\n")
         self.update_status("nikto done.")
+
+    # --- Screenshots (gowitness) ------------------------------------------ #
+    def _build_screenshots_subtab(self, nb):
+        tab = ttk.Frame(nb, padding=8)
+        nb.add(tab, text="Screenshots")
+        self.shots_input = self._mini_targets(
+            tab, "URLs / hosts to screenshot (bare hosts get http:// and https:// tried):",
+            [("Load live hosts",
+              lambda: self._fill(self.shots_input, self.state.get("live_urls")
+                                 or self.state["live_hosts"])),
+             ("Load subdomains",
+              lambda: self._fill(self.shots_input, self.state.get("subdomains")))])
+        opt = ttk.Frame(tab)
+        opt.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        self.shots_threads = tk.IntVar(value=4)
+        self.shots_timeout = tk.IntVar(value=20)
+        self.shots_delay = tk.IntVar(value=3)
+        for label, var, lo, hi in (("Threads:", self.shots_threads, 1, 32),
+                                   ("Timeout (s):", self.shots_timeout, 5, 120),
+                                   ("Delay (s):", self.shots_delay, 0, 15)):
+            ttk.Label(opt, text=label).pack(side="left", padx=(0, 2))
+            ttk.Spinbox(opt, from_=lo, to=hi, width=4, textvariable=var
+                        ).pack(side="left", padx=(0, 10))
+        self.shots_fullpage = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text="Full page", variable=self.shots_fullpage
+                        ).pack(side="left", padx=(0, 10))
+        ttk.Label(opt, text="Only codes:").pack(side="left")
+        self.shots_codes = ttk.Entry(opt, width=14)
+        self.shots_codes.pack(side="left", padx=4)
+        ttk.Label(opt, text="(e.g. 200,401,403; blank = all)").pack(side="left")
+
+        bar = ttk.Frame(tab)
+        bar.grid(row=4, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+        btn = ttk.Button(bar, text="Take screenshots", command=self.start_screenshots)
+        btn.pack(side="left")
+        self.run_buttons.append(btn)
+        ttk.Button(bar, text="Open gallery (report server)",
+                   command=self.open_shots_report).pack(side="left", padx=6)
+        ttk.Button(bar, text="Open screenshots folder",
+                   command=self.open_shots_folder).pack(side="left")
+        self.outputs["shots"] = self._make_output(tab)
+
+    @staticmethod
+    def _chrome_path():
+        for name in ("chromium", "chromium-browser", "google-chrome",
+                     "google-chrome-stable"):
+            p = shutil.which(name)
+            if p:
+                return p
+        return None
+
+    @staticmethod
+    def _pin_default_port(target):
+        """gowitness applies its port list (80,443) even to full URLs, so
+        'https://x' would also be probed as 'https://x:80'. Pin the scheme's
+        default port on URLs that lack one; leave bare hosts for gowitness to
+        probe over http and https."""
+        parts = urlsplit(target)
+        if parts.scheme in ("http", "https") and parts.hostname and parts.port is None:
+            port = 443 if parts.scheme == "https" else 80
+            host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+            netloc = (parts.netloc.rsplit("@", 1)[0] + "@" if "@" in parts.netloc
+                      else "") + f"{host}:{port}"
+            return parts._replace(netloc=netloc).geturl()
+        return target
+
+    def start_screenshots(self):
+        targets = self.scope_filter(self._lines_from(self.shots_input),
+                                    self.outputs["shots"])
+        if not targets:
+            messagebox.showwarning("Input", "No in-scope URLs/hosts to screenshot.")
+            return
+        self._launch(self.run_screenshots, self.outputs["shots"], (targets,))
+
+    def run_screenshots(self, targets):
+        w = self.outputs["shots"]
+        if not self.require(w, "gowitness"):
+            return
+        chrome = self._chrome_path()
+        if not chrome:
+            self.append(w, "[!] No Chromium/Chrome found — gowitness needs one. "
+                           "Install with: sudo apt install chromium\n")
+            return
+        outdir = self.state["outdir"] or self._new_outdir(
+            re.sub(r'^https?://', '', targets[0]).split("/")[0])
+        shots = os.path.join(outdir, "screenshots")
+        os.makedirs(shots, exist_ok=True)
+        db = os.path.join(outdir, "gowitness.sqlite3")
+        jsonl = os.path.join(outdir, "gowitness.jsonl")
+        tfile = os.path.join(outdir, "screenshot_targets.txt")
+        with open(tfile, "w") as f:
+            f.write("\n".join(self._pin_default_port(t) for t in targets) + "\n")
+
+        cmd = ["gowitness", "--no-log-color", "scan", "file", "-f", tfile,
+               "-s", shots, "--write-db", "--write-db-uri", f"sqlite://{db}",
+               "--write-jsonl", "--write-jsonl-file", jsonl,
+               "-t", str(self.shots_threads.get()), "-T", str(self.shots_timeout.get()),
+               "--delay", str(self.shots_delay.get()), "--chrome-path", chrome,
+               # gorod, not the default chromedp: with Chromium 150 chromedp's
+               # capture call intermittently hangs until timeout (page loads,
+               # title is read, but no screenshot); gorod was reliable.
+               "--driver", "gorod"]
+        if self.shots_fullpage.get():
+            cmd += ["--screenshot-fullpage"]
+        codes = [c for c in re.split(r'[,\s]+', self.shots_codes.get().strip())
+                 if c.isdigit()]
+        if codes:
+            cmd += ["--http-code-filter", ",".join(codes)]
+        # Global request settings: Burp proxy, headers/cookie, browser UA.
+        if self._proxy_url():
+            cmd += ["--chrome-proxy", self._proxy_url()]
+        for h in self._all_headers():
+            name, _, value = h.partition(":")
+            if name.strip().lower() == "user-agent":
+                cmd += ["--chrome-user-agent", value.strip()]
+            else:
+                cmd += ["--chrome-header", h]
+
+        n = len(targets)
+        self.append(w, f"--- gowitness: {n} target(s), {self.shots_threads.get()} "
+                       f"thread(s) · {self.proxy_summary()} ---\n")
+        self.update_status(f"gowitness: screenshotting {n} target(s) ...")
+        self.run_stream(cmd, w)
+        self.state["shots_dir"] = outdir
+        self._shots_summary(w, jsonl, shots, n)
+
+    def _shots_summary(self, w, jsonl, shots, n_targets):
+        """Summarize gowitness' JSONL results: one line per page, sorted by status."""
+        rows = []
+        try:
+            with open(jsonl) as f:
+                for ln in f:
+                    try:
+                        j = json.loads(ln)
+                    except ValueError:
+                        continue
+                    tech = ", ".join(t.get("value", "") for t in
+                                     (j.get("technologies") or []) if t.get("value"))
+                    rows.append((j.get("response_code") or 0, j.get("url", ""),
+                                 (j.get("title") or "").strip(),
+                                 bool(j.get("failed")), tech))
+        except OSError:
+            pass
+        n_png = len([f for f in os.listdir(shots)
+                     if f.lower().endswith((".jpeg", ".jpg", ".png"))]) \
+            if os.path.isdir(shots) else 0
+        if not rows:
+            self.append(w, f"\n[!] No results recorded ({n_png} screenshot file(s)). "
+                           "Check the log above for Chrome/network errors.\n")
+            return
+        ok = [r for r in rows if not r[3]]
+        self.append(w, f"\n=== {len(ok)} page(s) captured from {n_targets} target(s), "
+                       f"{n_png} screenshot(s) ===\n"
+                       "    (targets with no line below were unreachable or filtered)\n")
+        for code, url, title, failed, tech in sorted(rows,
+                                                     key=lambda r: (r[3], r[0], r[1])):
+            tag = "FAIL" if failed else str(code)
+            line = f"  [{tag:>4}] {url}"
+            if title:
+                line += f"  — {title[:70]}"
+            if tech:
+                line += f"  [{tech[:60]}]"
+            self.append(w, line + "\n")
+        self.append(w, f"\n[+] Screenshots: {shots}\n"
+                       "    'Open gallery' browses them with titles, tech & headers.\n")
+        self.update_status(f"gowitness done: {len(ok)} page(s) captured.")
+
+    def _shots_paths(self):
+        d = self.state.get("shots_dir")
+        if not d:
+            return None
+        return d, os.path.join(d, "gowitness.sqlite3"), os.path.join(d, "screenshots")
+
+    def open_shots_folder(self):
+        p = self._shots_paths()
+        if not p or not os.path.isdir(p[2]):
+            messagebox.showinfo("Screenshots", "No screenshots yet — run them first.")
+            return
+        subprocess.Popen(["xdg-open", p[2]], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+    def open_shots_report(self):
+        """Serve the latest run's gallery with `gowitness report server` on a free
+        localhost port and open it in the browser. Restarts if already running."""
+        p = self._shots_paths()
+        if not p or not os.path.exists(p[1]):
+            messagebox.showinfo("Screenshots", "No gowitness results yet — run "
+                                               "'Take screenshots' first.")
+            return
+        if not self.has_tool("gowitness"):
+            messagebox.showwarning("Screenshots", "gowitness is not installed.")
+            return
+        self._stop_shots_server()
+        import socket
+        import webbrowser
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self._shots_server = subprocess.Popen(
+            ["gowitness", "--no-log-color", "report", "server", "--host", "127.0.0.1",
+             "--port", str(port), "--db-uri", f"sqlite://{p[1]}",
+             "--screenshot-path", p[2]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        url = f"http://127.0.0.1:{port}/"
+        self.append(self.outputs["shots"], f"[+] Gallery served at {url} "
+                                           "(stops when GhostRecon closes)\n")
+        # give the server a moment to bind before the browser hits it
+        self.master.after(1500, lambda: webbrowser.open(url))
+
+    def _stop_shots_server(self):
+        srv = getattr(self, "_shots_server", None)
+        if srv and srv.poll() is None:
+            srv.terminate()
+            try:
+                srv.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                srv.kill()
+        self._shots_server = None
 
     # ================================================================== #
     # Active Testing tab (SQLMap · LFImap · Dalfox)

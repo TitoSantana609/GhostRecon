@@ -14,7 +14,7 @@ A GUI reconnaissance toolkit by [@TitoSantana00](https://github.com/TitoSantana6
     subfaster,          alive +      ├──> 6. Dir Busting (dirb + ffuf, merged results)
     crt.sh / crt.name)  title + tech)├──> 3. URLs (gau + waybackurls + katana) ─> gf ─> uro
                                      │
-                                     ├──> 7. Recon+ : JS & secrets · takeover · params · vhosts
+                                     ├──> 7. Recon+ : JS & secrets · takeover · params · vhosts · screenshots
                                      └──> 8. Web Scan : 403 bypass · wpscan · nikto
 ```
 
@@ -42,6 +42,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
   - **Params** — hidden-parameter discovery with **`arjun`** (GET/POST/JSON/XML, threads, honouring your global headers and rate).
   - **Vhosts** — virtual-host fuzzing with `ffuf` (`Host: FUZZ.<domain>`), auto-calibrated so only real vhosts surface.
   - **API Routes** — API endpoint discovery with **`kiterunner`** (`kr scan`). Point it at a local `.kite`/`.txt` wordlist or a named **Assetnote** wordlist (`-A`, auto-downloaded), set preflight depth and connections/host, and it honours the global Burp proxy, headers and rate (converted to `--delay`). A **Download kite wordlists** button fetches Assetnote's `routes-small.kite` (and optionally `routes-large.kite`) into `~/.cache/kiterunner/` and uses it as the default — these method-aware route lists are what make kiterunner better than a generic brute-forcer for APIs.
+  - **Screenshots** — visual triage with **`gowitness`** (headless Chromium): load live hosts or subdomains, set threads/timeout/delay, full-page, or only screenshot certain status codes. Each run saves screenshots plus a SQLite DB and JSONL under the run's results folder, and prints a per-page summary (status, title, detected tech). **Open gallery** serves gowitness' report UI on a random localhost port (browse/filter all pages, similar pages grouped by perceptual hash); it stops when GhostRecon closes. Honours the global Burp proxy, headers/cookie/bug-bounty header and browser User-Agent. Also available as an opt-in **One-Stop** stage. Uses gowitness' `gorod` driver — the default `chromedp` driver intermittently hung on the capture step with current Chromium.
 - **Web Scan tab** (grouped sub-tabs):
   - **403 Bypass** — tries path mutations (`/.`, `//`, `/..;/`, `%2e`, trailing slash, extensions…), header tricks (`X-Forwarded-For`, `X-Original-URL`, `X-Rewrite-URL`, …) and alternate methods against a forbidden URL, flagging anything that turns a 401/403 into 2xx. Can load the 401/403 rows straight from Dir Busting.
   - **WPScan** — WordPress scan with enumeration of vulnerable plugins/themes/users, config backups, `--stealthy`, and an optional API token for CVE data.
@@ -83,6 +84,7 @@ Each stage can load its input from the previous one (or from the Scope picker), 
 | kiterunner (`kr`) | `go install github.com/assetnote/kiterunner/cmd/kr@latest` (or a [release binary](https://github.com/assetnote/kiterunner/releases)) |
 | wpscan | `sudo apt install wpscan` |
 | nikto | `sudo apt install nikto` |
+| gowitness | `go install github.com/sensepost/gowitness@latest` (or `sudo apt install gowitness`); needs Chromium (`sudo apt install chromium`) |
 | curl | `sudo apt install curl` (used by JS fetch + 403 bypass) |
 | SecLists (wordlists) | `sudo apt install seclists` |
 
