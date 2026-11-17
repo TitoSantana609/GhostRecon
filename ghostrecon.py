@@ -806,6 +806,7 @@ class GhostReconGUI:
 
         self.outputs = {}  # tab name -> Text widget (order must match tab order)
         self._build_scope_tab()
+        self._build_oneshot_tab()
         self._build_subdomain_tab()
         self._build_livehost_tab()
         self._build_url_tab()
@@ -1064,6 +1065,92 @@ class GhostReconGUI:
             self.append(widget, f"[scope] Blocked {len(blocked)} out-of-scope target(s): "
                                 f"{', '.join(blocked[:8])}{' …' if len(blocked) > 8 else ''}\n")
         return kept
+
+    # ------------------------------------------------------------------ #
+    # Tab: One-Stop — run the whole recon pipeline from a single URL.
+    # This tab is self-contained: it drives the existing per-stage runners
+    # in sequence (they already chain through self.state) and funnels all of
+    # their output into its own consolidated log, so the normal recon tabs
+    # are never written to and the usual manual workflow is untouched.
+    # ------------------------------------------------------------------ #
+    # (key, label, default-on). Heavy / intrusive / setup-needing stages
+    # default OFF; core recon + quick passive checks default ON.
+    ONESHOT_STAGES = [
+        ("subdomains",   "Subdomains (amass · subfinder · crt.sh)", True),
+        ("livehosts",    "Live hosts (httpx)",                      True),
+        ("urls",         "URLs & patterns (gau · katana · gf · uro)", True),
+        ("ports",        "Port scan (naabu / nmap)",                True),
+        ("nuclei",       "Vulnerabilities (nuclei)",                True),
+        ("js",           "JS analysis (katana · jsluice)",          True),
+        ("takeover",     "Subdomain takeover (dnsx · subzy)",       True),
+        ("cors",         "CORS misconfig (corsy)",                  True),
+        ("crlf",         "CRLF injection (crlfuzz)",                True),
+        ("openredirect", "Open redirect (OpenRedireX)",             True),
+        ("exposure",     "Exposed files (.env · .git · backups)",   True),
+        ("dirbust",      "Directory busting (dirb / ffuf)",         False),
+        ("params",       "Parameter discovery (arjun)",             False),
+        ("bypass",       "403 / 401 bypass",                        False),
+        ("nikto",        "Nikto web scan",                          False),
+        ("ssrf",         "SSRF (needs a reachable callback)",       False),
+    ]
+
+    def _build_oneshot_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="★ One-Stop")
+        tab.columnconfigure(1, weight=1)
+
+        ttk.Label(tab, text="One-Stop Recon — give one URL, run the whole pipeline",
+                  font=("Helvetica", 13, "bold")).grid(
+                      row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
+        ttk.Label(tab, foreground=THEMES[self.theme_name]["tab_fg"], wraplength=900,
+                  text=("Chains every recon stage from a single target and streams all "
+                        "output here. Results also land in results/<target>/. SQLMap, "
+                        "LFImap and Dalfox are intentionally excluded — they need "
+                        "targeted parameters/request files; run them from Active Testing.")
+                  ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(tab, text="Target URL / domain:").grid(row=2, column=0, sticky="w", padx=5)
+        self.os_target = ttk.Entry(tab, width=55)
+        self.os_target.grid(row=2, column=1, sticky="ew", padx=5, pady=4)
+        self.os_target.bind("<Return>", lambda e: self.start_oneshot())
+        self.os_run_btn = ttk.Button(tab, text="▶ Run Full Pipeline",
+                                     command=self.start_oneshot)
+        self.os_run_btn.grid(row=2, column=2, padx=5)
+        self.run_buttons.append(self.os_run_btn)
+
+        # Stage selection grid
+        box = ttk.LabelFrame(tab, text="Stages to run", padding=8)
+        box.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4, pady=6)
+        self.os_stage_vars = {}
+        ncols = 2
+        for i, (key, label, default) in enumerate(self.ONESHOT_STAGES):
+            var = tk.BooleanVar(value=default)
+            self.os_stage_vars[key] = var
+            ttk.Checkbutton(box, text=label, variable=var).grid(
+                row=i // ncols, column=i % ncols, sticky="w", padx=6, pady=1)
+        for c in range(ncols):
+            box.columnconfigure(c, weight=1)
+
+        ctl = ttk.Frame(tab)
+        ctl.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 4))
+        ttk.Button(ctl, text="Select all",
+                   command=lambda: [v.set(True) for v in self.os_stage_vars.values()]
+                   ).pack(side="left")
+        ttk.Button(ctl, text="Select none",
+                   command=lambda: [v.set(False) for v in self.os_stage_vars.values()]
+                   ).pack(side="left", padx=6)
+        ttk.Button(ctl, text="Defaults", command=self._oneshot_reset_defaults
+                   ).pack(side="left", padx=(0, 16))
+        ttk.Label(ctl, text="Max hosts/URLs per stage:").pack(side="left")
+        self.os_maxhosts = tk.IntVar(value=10)
+        ttk.Spinbox(ctl, from_=1, to=500, width=5, textvariable=self.os_maxhosts
+                    ).pack(side="left", padx=4)
+
+        self.ro_output = self._make_output(tab)
+
+    def _oneshot_reset_defaults(self):
+        for key, _label, default in self.ONESHOT_STAGES:
+            self.os_stage_vars[key].set(default)
 
     # --- Tab: Subdomains -------------------------------------------------- #
     def _build_subdomain_tab(self):
@@ -1874,8 +1961,124 @@ class GhostReconGUI:
         self.update_status(f"{len(missing)} tool(s) missing.")
 
     # ------------------------------------------------------------------ #
-    # Settings: auto-install missing tools
+    # Settings: auto-install missing tools  (+ self-healing diagnostics)
     # ------------------------------------------------------------------ #
+    # Named-on-PyPI tools we can fall back to installing in a dedicated venv
+    # (console-script name) when the system blocks a plain pip/pipx install.
+    PIP_PKG = {
+        "lfimap":      ("lfimap",      ["lfimap"]),
+        "uro":         ("uro",         ["uro"]),
+        "arjun":       ("arjun",       ["arjun"]),
+        "js-beautify": ("jsbeautifier", ["js-beautify"]),
+    }
+    GR_TOOLS_DIR = "~/.local/share/ghostrecon-tools"
+
+    def _go_toolchain_cmd(self):
+        """Shell that downloads the latest official Go into the GhostRecon tools
+        dir. Used to self-heal 'go too old' / 'go not found' install failures
+        without touching the system/apt Go."""
+        grt = self.GR_TOOLS_DIR
+        return (
+            f'set -e; GRT="$(eval echo {grt})"; mkdir -p "$GRT"; '
+            'ARCH=$(uname -m | sed "s/aarch64/arm64/;s/x86_64/amd64/;s/armv7l/armv6l/"); '
+            'VER=$(curl -fsSL "https://go.dev/VERSION?m=text" | head -1); '
+            'test -n "$VER" || { echo "could not resolve latest Go version"; exit 1; }; '
+            'echo "downloading ${VER} (linux-${ARCH}) ..."; '
+            'curl -fsSL -o /tmp/gr_go.tgz "https://go.dev/dl/${VER}.linux-${ARCH}.tar.gz"; '
+            'rm -rf "$GRT/go"; tar -xzf /tmp/gr_go.tgz -C "$GRT"; rm -f /tmp/gr_go.tgz; '
+            'echo "installed ${VER} to $GRT/go"'
+        )
+
+    def _venv_pip_cmd(self, pkgs, cmds):
+        """Shell that installs PyPI packages into the shared GhostRecon venv and
+        links their console scripts onto ~/.local/bin — the PEP 668 fallback."""
+        links = "; ".join(
+            'ln -sf "$GRT/.venv/bin/%s" "$HOME/.local/bin/%s"' % (c, c) for c in cmds)
+        grt = self.GR_TOOLS_DIR
+        return (
+            f'GRT="$(eval echo {grt})"; mkdir -p "$HOME/.local/bin"; '
+            'test -d "$GRT/.venv" || python3 -m venv "$GRT/.venv"; '
+            '"$GRT/.venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true; '
+            '"$GRT/.venv/bin/pip" install -q %s && { %s; }' % (pkgs, links)
+        )
+
+    def _go_bin_dir(self):
+        return os.path.expanduser(self.GR_TOOLS_DIR + "/go/bin")
+
+    def _diagnose_install(self, name, method, cmd, output):
+        """Inspect a failed install's captured output and work out what the tool
+        actually needs. Returns a remediation dict understood by the retry path:
+            {why, pre, pre_go, cmd}
+        where `pre` is an optional prerequisite shell step, `pre_go` flags that a
+        fresh Go toolchain was placed and PATH must be updated, and `cmd` is the
+        (possibly rewritten) install command to run on retry. `cmd=None` means the
+        fix is manual (no auto-retry)."""
+        low = (output or "").lower()
+
+        # --- transient network failure (checked first: can hit any method) -- #
+        if ('could not resolve host' in low or 'connection refused' in low
+                or 'connection timed out' in low or 'temporary failure in name' in low
+                or 'tls handshake timeout' in low or 'i/o timeout' in low
+                or 'network is unreachable' in low):
+            return {"why": "Looks like a network error. Fix: retry the same command.",
+                    "pre": None, "pre_go": False, "cmd": cmd}
+
+        # --- Go module needs a newer Go than is installed ------------------- #
+        mver = re.search(r'requires go[ >=]*([0-9]+\.[0-9]+(?:\.[0-9]+)?)', low)
+        if not mver:
+            mver = re.search(r'go\.mod[^\n]*\bgo ([0-9]+\.[0-9]+)', low)
+        go_old = bool(mver) or 'note: module requires go' in low or \
+            'but go.mod requires go' in low or 'compile: version "go' in low or \
+            'invalid go version' in low or 'go: updates to go.mod needed' in low
+        if method == "go" and go_old and self.has_tool("go"):
+            want = mver.group(1) if mver else "a newer"
+            return {
+                "why": (f"This module needs Go {want}, but the Go on PATH is older. "
+                        "Fix: fetch the latest official Go toolchain into "
+                        f"{self.GR_TOOLS_DIR}/go and retry the build with it."),
+                "pre": self._go_toolchain_cmd(), "pre_go": True, "cmd": cmd,
+            }
+
+        # --- Go not installed at all ---------------------------------------- #
+        if method == "go" and ('command not found' in low or 'go: not found' in low
+                               or ': go: ' in low or not self.has_tool("go")):
+            return {
+                "why": ("The Go toolchain isn't installed. Fix: fetch the latest "
+                        f"official Go into {self.GR_TOOLS_DIR}/go and retry."),
+                "pre": self._go_toolchain_cmd(), "pre_go": True, "cmd": cmd,
+            }
+
+        # --- Python: PEP 668 externally-managed / pipx missing -------------- #
+        pep668 = 'externally-managed-environment' in low or 'externally managed' in low
+        pipx_missing = ('pipx: command not found' in low or 'pipx: not found' in low
+                        or 'no module named pipx' in low or ': pipx:' in low)
+        if method == "pip" and name in self.PIP_PKG:
+            pkg, consoles = self.PIP_PKG[name]
+            if pep668:
+                why = ("This system blocks pip from installing into it (PEP 668 "
+                       "'externally-managed-environment'). Fix: install "
+                       f"{pkg} into a dedicated venv and link it onto your PATH.")
+            elif pipx_missing:
+                why = ("pipx isn't available, so the pipx path failed. Fix: install "
+                       f"{pkg} into a dedicated venv and link it onto your PATH.")
+            else:
+                why = (f"The pip install of {pkg} failed. Fix: retry inside a "
+                       "dedicated venv and link it onto your PATH.")
+            return {"why": why, "pre": None, "pre_go": False,
+                    "cmd": self._venv_pip_cmd(pkg, consoles)}
+
+        # --- apt needs sudo / interactive ----------------------------------- #
+        if method == "apt" and ('are you root' in low or 'permission denied' in low
+                                or 'sudo: a password is required' in low
+                                or 'could not open lock' in low):
+            return {"why": ("This package installs via apt and needs root. Fix: run "
+                            f"in a terminal:\n        {cmd}"),
+                    "pre": None, "pre_go": False, "cmd": None}
+
+        # --- unknown: still let the user re-run the same command ------------- #
+        return {"why": "Install failed (see log). Retrying re-runs the same command.",
+                "pre": None, "pre_go": False, "cmd": cmd}
+
     def open_install_dialog(self):
         win = tk.Toplevel(self.master)
         win.title("Install Missing Tools")
@@ -1888,8 +2091,9 @@ class GhostReconGUI:
 
         have_go = self.has_tool("go")
         note = "Go toolchain detected." if have_go else \
-            "⚠ 'go' not found — Go-based tools can't be installed until you install Go."
-        ttk.Label(win, text=note).pack(anchor="w", padx=12, pady=(0, 8))
+            ("ⓘ 'go' not found — GhostRecon will fetch the official Go toolchain "
+             "automatically if you install a Go-based tool.")
+        ttk.Label(win, text=note, wraplength=690).pack(anchor="w", padx=12, pady=(0, 8))
 
         list_frame = ttk.Frame(win)
         list_frame.pack(fill="x", padx=12)
@@ -1902,7 +2106,9 @@ class GhostReconGUI:
             method, cmd = self.INSTALL.get(name, (None, None))
             row = ttk.Frame(list_frame)
             row.pack(fill="x", pady=1)
-            installable = method in ("go", "pip") and (have_go or method == "pip")
+            # go/pip are auto-installable; a missing Go gets bootstrapped on demand,
+            # so Go tools are selectable even before Go is present.
+            installable = method in ("go", "pip")
             var = tk.BooleanVar(value=installable)
             self._install_vars[name] = (var, method, cmd)
             cb = ttk.Checkbutton(row, variable=var, text=f"{name}")
@@ -1910,7 +2116,7 @@ class GhostReconGUI:
             if method == "apt":
                 hint = "needs sudo — run in a terminal"
             elif method == "go" and not have_go:
-                hint = "needs Go"
+                hint = "needs Go (fetched automatically)"
             elif cmd is None:
                 hint = "no known installer"
             else:
@@ -1928,41 +2134,125 @@ class GhostReconGUI:
         btnrow.pack(fill="x", padx=12, pady=(0, 12))
         install_btn = ttk.Button(btnrow, text="Install Selected")
         install_btn.pack(side="right")
+        retry_btn = ttk.Button(btnrow, text="⟳ Retry failed (apply fixes)")
+        retry_btn.pack(side="right", padx=6)
         ttk.Button(btnrow, text="Close", command=win.destroy).pack(side="right", padx=6)
+
+        # Failures persist on self so a reopened dialog can still retry them.
+        if not hasattr(self, "_install_failures"):
+            self._install_failures = {}   # name -> {method, cmd, rem}
 
         def append(text):
             win.after(0, lambda: (out.config(state="normal"), out.insert(tk.END, text),
                                   out.see(tk.END), out.config(state="disabled")))
 
-        def do_install():
-            chosen = [(n, c) for n, (v, m, c) in self._install_vars.items()
-                      if v.get() and c]
-            if not chosen:
-                append("Nothing selected.\n")
-                return
-            install_btn.config(state=tk.DISABLED)
+        def set_running(flag):
+            install_btn.config(state=(tk.DISABLED if flag else tk.NORMAL))
+            fixable = any(d.get("rem") and d["rem"].get("cmd")
+                          for d in self._install_failures.values())
+            retry_btn.config(state=(tk.NORMAL if (not flag and fixable) else tk.DISABLED))
+
+        def stream(command, sink=None):
+            """Run a shell command, streaming output into the log (and optionally
+            collecting it for diagnosis). Returns the exit code."""
+            try:
+                proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, bufsize=1)
+            except Exception as e:
+                append(f"[ERROR] could not start: {e}\n")
+                if sink is not None:
+                    sink.append(str(e))
+                return 1
+            for line in proc.stdout:
+                append(line)
+                if sink is not None:
+                    sink.append(line)
+            proc.wait()
+            return proc.returncode
+
+        def run_one(name, method, cmd, rem=None):
+            """Install one tool, optionally applying a diagnosed remediation.
+            Records/clears the failure and returns True on success."""
+            if rem and rem.get("pre"):
+                append(f"\n--- preparing prerequisite for {name} ---\n")
+                stream(rem["pre"])
+                if rem.get("pre_go"):
+                    gb = self._go_bin_dir()
+                    if os.path.isdir(gb) and gb not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = gb + os.pathsep + os.environ.get("PATH", "")
+                        append(f"    ↳ added {gb} to PATH for this session\n")
+            runcmd = (rem or {}).get("cmd") or cmd
+            if not runcmd:
+                append(f"\n=== {name}: no automatic installer — manual step required ===\n")
+                return False
+            append(f"\n=== Installing {name} ===\n$ {runcmd}\n")
+            captured = []
+            stream(runcmd, captured)
+            if self.has_tool(name):
+                append(f"[OK] {name} installed.\n")
+                self._install_failures.pop(name, None)
+                return True
+            # Failed: diagnose what the tool actually needs and remember it.
+            diag = self._diagnose_install(name, method, runcmd, "".join(captured))
+            self._install_failures[name] = {"method": method, "cmd": cmd, "rem": diag}
+            append(f"[FAILED] {name} — not found after install.\n")
+            if diag and diag.get("why"):
+                append(f"    ↳ diagnosis: {diag['why']}\n")
+                append("    ↳ Click '⟳ Retry failed (apply fixes)' below.\n"
+                       if diag.get("cmd")
+                       else "    ↳ This needs a manual step (above); auto-retry isn't available.\n")
+            return False
+
+        def run_jobs(jobs, header=None):
+            """jobs: list of (name, method, cmd, rem). Runs in a worker thread."""
+            win.after(0, lambda: set_running(True))
 
             def worker():
-                for name, cmd in chosen:
-                    append(f"\n=== Installing {name} ===\n$ {cmd}\n")
-                    try:
-                        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
-                                                stderr=subprocess.STDOUT, text=True, bufsize=1)
-                        for line in proc.stdout:
-                            append(line)
-                        proc.wait()
-                        ok = self.has_tool(name)
-                        append(f"[{'OK' if ok else 'FAILED'}] {name} "
-                               f"{'installed' if ok else 'not found after install'}\n")
-                    except Exception as e:
-                        append(f"[ERROR] {name}: {e}\n")
-                append("\nDone. Re-open this dialog to refresh the list.\n")
-                win.after(0, lambda: install_btn.config(state=tk.NORMAL))
+                if header:
+                    append(header)
+                for name, method, cmd, rem in jobs:
+                    run_one(name, method, cmd, rem)
+                append("\nDone.\n")
+                if self._install_failures:
+                    fixable = [n for n, d in self._install_failures.items()
+                               if d.get("rem") and d["rem"].get("cmd")]
+                    append(f"{len(self._install_failures)} still missing: "
+                           f"{', '.join(sorted(self._install_failures))}.\n")
+                    if fixable:
+                        append(f"    → '⟳ Retry failed (apply fixes)' can auto-fix: "
+                               f"{', '.join(sorted(fixable))}\n")
+                win.after(0, lambda: set_running(False))
                 self.update_status("Tool installation finished.")
 
             threading.Thread(target=worker, daemon=True).start()
 
+        def do_install():
+            chosen = [(n, m, c) for n, (v, m, c) in self._install_vars.items()
+                      if v.get() and c]
+            if not chosen:
+                append("Nothing selected.\n")
+                return
+            run_jobs([(n, m, c, None) for n, m, c in chosen])
+
+        def do_retry():
+            jobs = [(n, d["method"], d["cmd"], d["rem"])
+                    for n, d in self._install_failures.items()
+                    if d.get("rem") and d["rem"].get("cmd")]
+            if not jobs:
+                append("No auto-fixable failures to retry.\n")
+                return
+            run_jobs(jobs, header="\n########## RETRY WITH DIAGNOSED FIXES ##########\n")
+
         install_btn.config(command=do_install)
+        retry_btn.config(command=do_retry)
+        # Reflect any failures carried over from a previous dialog session.
+        set_running(False)
+        if self._install_failures:
+            fixable = [n for n, d in self._install_failures.items()
+                       if d.get("rem") and d["rem"].get("cmd")]
+            if fixable:
+                append(f"Previous session left fixable failures: {', '.join(sorted(fixable))}.\n"
+                       "Click '⟳ Retry failed (apply fixes)' to apply the diagnosed fixes.\n")
 
     # ------------------------------------------------------------------ #
     # Settings: nuclei engine / template updates
@@ -2083,6 +2373,182 @@ class GhostReconGUI:
     # ------------------------------------------------------------------ #
     # Stage 1: Subdomains
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # One-Stop orchestrator
+    # ------------------------------------------------------------------ #
+    def _oneshot_apex(self, bare):
+        """Best-effort registrable domain from a host. Returns None for an IP."""
+        if IP_RE.match(bare):
+            return None
+        labels = bare.split(".")
+        if len(labels) <= 2:
+            return bare
+        two_level = {"co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "com.au",
+                     "net.au", "org.au", "co.jp", "co.nz", "co.za", "com.br",
+                     "com.mx", "co.in", "co.kr"}
+        if ".".join(labels[-2:]) in two_level:
+            return ".".join(labels[-3:])
+        return ".".join(labels[-2:])
+
+    def _oneshot_dirbust_cfg(self):
+        """Build a minimal valid dirbust cfg from the Dir Busting tab's wordlist
+        settings. Returns None (skip) if no usable tool+wordlist is available."""
+        dirb_wl = self.dirb_wordlist.get().strip()
+        ffuf_wl = self.ffuf_wordlist.get().strip()
+        use_ffuf = self.has_tool("ffuf") and os.path.isfile(ffuf_wl)
+        use_dirb = self.has_tool("dirb") and os.path.isfile(dirb_wl)
+        if not (use_ffuf or use_dirb):
+            return None
+        try:
+            threads = max(1, int(self.db_threads.get()))
+            rate = max(0, int(self.db_rate.get()))
+        except (tk.TclError, ValueError):
+            threads, rate = 20, 0
+        return {
+            "dirb": use_dirb, "ffuf": use_ffuf,
+            "dirb_wl": dirb_wl, "ffuf_wl": ffuf_wl,
+            "threads": threads, "rate": rate,
+            "jitter": self.db_jitter.get(),
+            "ua": BROWSER_UA if self.db_browser_ua.get() else None,
+            "recursive": self.db_recursive.get(),
+            "fspec": {"mc": parse_ranges(FFUF_DEFAULT_MC), "fc": [], "fs": [],
+                      "fw": [], "fl": [], "fr": None, "ac": False},
+        }
+
+    def start_oneshot(self):
+        raw = self.os_target.get().strip().lower()
+        bare = re.sub(r'^https?://', '', raw).split("/")[0].split(":")[0]
+        if not (raw and is_host(bare)):
+            messagebox.showwarning("Input", "Enter a valid URL or domain, e.g. "
+                                            "https://example.com or example.com")
+            return
+        if not any(v.get() for v in self.os_stage_vars.values()):
+            messagebox.showwarning("Stages", "Select at least one stage to run.")
+            return
+        self._launch(self.run_oneshot, self.ro_output, (raw,))
+
+    def run_oneshot(self, raw):
+        w = self.ro_output
+        bare = re.sub(r'^https?://', '', raw).split("/")[0].split(":")[0]
+        target_url = raw if re.match(r'^https?://', raw) else f"https://{bare}"
+        apex = self._oneshot_apex(bare)
+        try:
+            lim = max(1, int(self.os_maxhosts.get()))
+        except (tk.TclError, ValueError):
+            lim = 10
+        self._new_outdir(bare)
+        ctx = {"bare": bare, "target_url": target_url, "apex": apex, "lim": lim}
+
+        enabled = [(k, lbl) for k, lbl, _d in self.ONESHOT_STAGES
+                   if self.os_stage_vars[k].get()]
+        self.append(w, "=" * 70 + "\n")
+        self.append(w, f"  ONE-STOP RECON  →  {target_url}\n")
+        self.append(w, f"  apex: {apex or '(IP — subdomain enum skipped)'}   "
+                       f"cap: {lim}/stage   stages: {len(enabled)}\n")
+        self.append(w, f"  results dir: {self.state['outdir']}\n")
+        self.append(w, "=" * 70 + "\n")
+
+        # Funnel every stage runner's output into this one log; the real recon
+        # tabs are left untouched. Restored in `finally`.
+        saved_outputs = dict(self.outputs)
+        for k in list(self.outputs):
+            self.outputs[k] = w
+        done, failed, skipped = [], [], []
+        try:
+            for idx, (key, label) in enumerate(enabled, 1):
+                if self.stop_requested:
+                    self.append(w, "\n[!] Stopped by user — aborting remaining stages.\n")
+                    break
+                self.append(w, f"\n{'─' * 70}\n[{idx}/{len(enabled)}] {label}\n{'─' * 70}\n")
+                self.update_status(f"One-Stop [{idx}/{len(enabled)}]: {label}")
+                try:
+                    status = self._oneshot_dispatch(key, ctx)
+                    if status == "skip":
+                        skipped.append(label)
+                        self.append(w, f"[skip] {label}\n")
+                    else:
+                        done.append(label)
+                except Exception as e:
+                    failed.append(label)
+                    self.append(w, f"[!] Stage error ({label}): {e}\n")
+        finally:
+            self.outputs.update(saved_outputs)
+
+        self.append(w, "\n" + "=" * 70 + "\n  ONE-STOP SUMMARY\n" + "=" * 70 + "\n")
+        self.append(w, f"  subdomains : {len(self.state.get('subdomains', []))}\n")
+        self.append(w, f"  live hosts : {len(self.state.get('live_hosts', []))}\n")
+        self.append(w, f"  URLs       : {len(self.state.get('urls', []))}\n")
+        self.append(w, f"  ran        : {len(done)}   "
+                       f"skipped: {len(skipped)}   errored: {len(failed)}\n")
+        if skipped:
+            self.append(w, f"  skipped → {', '.join(skipped)}\n")
+        if failed:
+            self.append(w, f"  errored → {', '.join(failed)}\n")
+        self.append(w, f"  results dir: {self.state['outdir']}\n")
+        self.update_status(f"One-Stop finished — {len(done)} ran, "
+                           f"{len(failed)} errored. Results in {self.state['outdir']}")
+
+    def _oneshot_dispatch(self, key, ctx):
+        """Prepare inputs from shared state and invoke the matching stage runner.
+        Return 'skip' to mark the stage as skipped (nothing to do)."""
+        bare, target_url, apex, lim = (ctx["bare"], ctx["target_url"],
+                                       ctx["apex"], ctx["lim"])
+        st = self.state
+        live_urls = st.get("live_urls") or []
+        live_hosts = st.get("live_hosts") or []
+        urls = st.get("urls") or []
+        subs = st.get("subdomains") or []
+        param_urls = [u for u in urls if "?" in u]
+        web = live_urls or [target_url]
+
+        if key == "subdomains":
+            if not apex:
+                return "skip"   # IP target: nothing to enumerate
+            self.run_subdomains(apex)
+        elif key == "livehosts":
+            hosts = sorted(set(subs) | {bare})
+            self.run_httpx(hosts)
+        elif key == "urls":
+            self.run_url_recon(target_url, bare)
+        elif key == "ports":
+            for h in (live_hosts or [bare])[:lim]:
+                if self.stop_requested:
+                    break
+                self.run_port_scan(h)
+        elif key == "nuclei":
+            self.run_nuclei((live_urls or live_hosts or [target_url])[:max(lim, 50)])
+        elif key == "js":
+            js_urls = [u for u in urls if re.search(r'\.js(\?|$)', u, re.I)]
+            items = js_urls[:max(lim, 50)] if js_urls else (live_hosts or [target_url])[:lim]
+            self.run_js(items)
+        elif key == "takeover":
+            self.run_takeover(subs or live_hosts or [bare])
+        elif key == "cors":
+            self.run_cors(web[:lim])
+        elif key == "crlf":
+            self.run_crlf((param_urls or web)[:lim])
+        elif key == "openredirect":
+            self.run_openredirect((param_urls or web)[:lim])
+        elif key == "exposure":
+            self.run_exposure((live_urls or live_hosts or [target_url])[:lim])
+        elif key == "dirbust":
+            cfg = self._oneshot_dirbust_cfg()
+            if cfg is None:
+                self.append(self.ro_output,
+                            "[skip] no dirb/ffuf + wordlist configured "
+                            "(set one in the Dir Busting tab).\n")
+                return "skip"
+            self.run_dirbust((live_urls or [target_url])[:lim], cfg)
+        elif key == "params":
+            self.run_params((param_urls or live_urls)[:lim] or [target_url])
+        elif key == "bypass":
+            self.run_bypass(web[:lim])
+        elif key == "nikto":
+            self.run_nikto(web[:min(lim, 3)])   # nikto is slow; cap hard
+        elif key == "ssrf":
+            self.run_ssrf((param_urls or web)[:lim])
+        return "ran"
+
     def start_subdomain_recon(self):
         domain = self.domain_entry.get().strip().lower()
         if not is_domain(domain):
