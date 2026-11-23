@@ -1575,6 +1575,11 @@ class GhostReconGUI:
         ttk.Checkbutton(ctl, text="Also run amass (slow; opt-in)",
                         variable=self._amass_var()).pack(side="left", padx=(16, 0))
 
+        extrow = ttk.Frame(tab)
+        extrow.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 4))
+        ttk.Label(extrow, text="Dir busting extensions:").pack(side="left", padx=(0, 4))
+        self._ext_widgets(extrow, hint="e.g. .aspx,.html — shared with the Dir Busting tab")
+
         self.ro_output = self._make_output(tab)
 
     def _oneshot_reset_defaults(self):
@@ -1603,6 +1608,32 @@ class GhostReconGUI:
                         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5)
 
         self.outputs["sub"] = self._make_output(tab)
+
+    def _ext_widgets(self, parent, hint):
+        """Extensions entry + 'bare words' toggle, packed into `parent`. The
+        variables are shared, so the Dir Busting tab and One-Stop stay in sync."""
+        if not hasattr(self, "db_extensions"):
+            self.db_extensions = tk.StringVar(value="")
+            self.db_ext_bare = tk.BooleanVar(value=True)
+        ttk.Entry(parent, textvariable=self.db_extensions, width=30).pack(side="left")
+        ttk.Checkbutton(parent, text="Also try bare words",
+                        variable=self.db_ext_bare).pack(side="left", padx=(8, 0))
+        ttk.Label(parent, text=hint, foreground="#888").pack(side="left", padx=(8, 0))
+
+    @staticmethod
+    def _parse_extensions(text):
+        """'.aspx, html .asp' -> ['.aspx', '.html', '.asp']. Raises ValueError
+        naming the first invalid entry."""
+        exts = []
+        for e in re.split(r'[\s,;]+', text.strip()):
+            if not e:
+                continue
+            e = e if e.startswith(".") else "." + e
+            if not re.match(r'^\.[A-Za-z0-9_.~-]+$', e):
+                raise ValueError(e)
+            if e not in exts:
+                exts.append(e)
+        return exts
 
     def _amass_var(self):
         """Shared opt-in toggle for amass (Subdomains tab + One-Stop). Off by default."""
@@ -1757,13 +1788,7 @@ class GhostReconGUI:
         ttk.Label(wl, text="Extensions:").grid(row=2, column=0, sticky="w")
         extf = ttk.Frame(wl)
         extf.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=(3, 1))
-        self.db_extensions = tk.StringVar(value="")
-        ttk.Entry(extf, textvariable=self.db_extensions, width=30).pack(side="left")
-        self.db_ext_bare = tk.BooleanVar(value=True)
-        ttk.Checkbutton(extf, text="Also try bare words",
-                        variable=self.db_ext_bare).pack(side="left", padx=(8, 0))
-        ttk.Label(extf, text="e.g. .aspx,.asp,.html  (word -> word.aspx; blank = off)",
-                  foreground="#888").pack(side="left", padx=(8, 0))
+        self._ext_widgets(extf, hint="e.g. .aspx,.asp,.html  (word -> word.aspx; blank = off)")
 
         opts = ttk.Frame(tab)
         opts.grid(row=4, column=0, columnspan=4, sticky="ew", padx=5, pady=(6, 0))
@@ -3314,6 +3339,9 @@ class GhostReconGUI:
             "jitter": self.db_jitter.get(),
             "ua": BROWSER_UA if self.db_browser_ua.get() else None,
             "recursive": self.db_recursive.get(),
+            # validated in start_oneshot before the pipeline launches
+            "exts": self._parse_extensions(self.db_extensions.get()),
+            "ext_bare": self.db_ext_bare.get(),
             "fspec": {"mc": parse_ranges(FFUF_DEFAULT_MC), "fc": [], "fs": [],
                       "fw": [], "fl": [], "fr": None, "ac": False},
         }
@@ -3325,6 +3353,13 @@ class GhostReconGUI:
             messagebox.showwarning("Input", "Enter a valid URL or domain, e.g. "
                                             "https://example.com or example.com")
             return
+        if self.os_stage_vars["dirbust"].get():
+            try:
+                self._parse_extensions(self.db_extensions.get())
+            except ValueError as e:
+                messagebox.showwarning("Extensions", f"Invalid dir busting extension: {e}\n"
+                                       "Use a comma-separated list like .aspx,.html")
+                return
         if not any(v.get() for v in self.os_stage_vars.values()):
             messagebox.showwarning("Stages", "Select at least one stage to run.")
             return
@@ -3787,18 +3822,12 @@ class GhostReconGUI:
         cfg["ua"] = BROWSER_UA if self.db_browser_ua.get() else None
         cfg["recursive"] = self.db_recursive.get()
 
-        exts = []
-        for e in re.split(r'[\s,;]+', self.db_extensions.get().strip()):
-            if not e:
-                continue
-            e = e if e.startswith(".") else "." + e
-            if not re.match(r'^\.[A-Za-z0-9_.~-]+$', e):
-                messagebox.showwarning("Extensions", f"Invalid extension: {e}\n"
-                                       "Use a comma-separated list like .aspx,.html")
-                return
-            if e not in exts:
-                exts.append(e)
-        cfg["exts"] = exts
+        try:
+            cfg["exts"] = self._parse_extensions(self.db_extensions.get())
+        except ValueError as e:
+            messagebox.showwarning("Extensions", f"Invalid extension: {e}\n"
+                                   "Use a comma-separated list like .aspx,.html")
+            return
         cfg["ext_bare"] = self.db_ext_bare.get()
 
         # ffuf runs with -mc all so every response reaches the live feed;
