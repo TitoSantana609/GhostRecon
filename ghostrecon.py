@@ -1751,6 +1751,18 @@ class GhostReconGUI:
             ttk.Button(wl, text="Browse…",
                        command=lambda v=var: self._browse_wordlist(v)
                        ).grid(row=r, column=2, pady=1)
+        # File extensions appended to every word (IIS/.NET-style sites where
+        # pages are e.g. login.aspx, default.html rather than directories)
+        ttk.Label(wl, text="Extensions:").grid(row=2, column=0, sticky="w")
+        extf = ttk.Frame(wl)
+        extf.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=(3, 1))
+        self.db_extensions = tk.StringVar(value="")
+        ttk.Entry(extf, textvariable=self.db_extensions, width=30).pack(side="left")
+        self.db_ext_bare = tk.BooleanVar(value=True)
+        ttk.Checkbutton(extf, text="Also try bare words",
+                        variable=self.db_ext_bare).pack(side="left", padx=(8, 0))
+        ttk.Label(extf, text="e.g. .aspx,.asp,.html  (word -> word.aspx; blank = off)",
+                  foreground="#888").pack(side="left", padx=(8, 0))
 
         opts = ttk.Frame(tab)
         opts.grid(row=4, column=0, columnspan=4, sticky="ew", padx=5, pady=(6, 0))
@@ -3774,6 +3786,20 @@ class GhostReconGUI:
         cfg["ua"] = BROWSER_UA if self.db_browser_ua.get() else None
         cfg["recursive"] = self.db_recursive.get()
 
+        exts = []
+        for e in re.split(r'[\s,;]+', self.db_extensions.get().strip()):
+            if not e:
+                continue
+            e = e if e.startswith(".") else "." + e
+            if not re.match(r'^\.[A-Za-z0-9_.~-]+$', e):
+                messagebox.showwarning("Extensions", f"Invalid extension: {e}\n"
+                                       "Use a comma-separated list like .aspx,.html")
+                return
+            if e not in exts:
+                exts.append(e)
+        cfg["exts"] = exts
+        cfg["ext_bare"] = self.db_ext_bare.get()
+
         # ffuf runs with -mc all so every response reaches the live feed;
         # GhostRecon applies these matchers/filters itself to decide hits.
         fspec = {"mc": parse_ranges(FFUF_DEFAULT_MC), "fc": [], "fs": [], "fw": [],
@@ -3826,6 +3852,20 @@ class GhostReconGUI:
                        f"{', jitter on' if cfg['jitter'] else ''}\n")
 
         fspec = cfg["fspec"]
+        exts = cfg.get("exts") or []
+        wls = {t: cfg[f"{t}_wl"] for t in tools}
+        if exts:
+            built = {}   # source wordlist -> expanded copy (shared if dirb == ffuf)
+            for t in tools:
+                src = wls[t]
+                if src not in built:
+                    dst = os.path.join(outdir, f"wordlist_{t}_ext.txt")
+                    n = self._expand_wordlist(src, exts, cfg["ext_bare"], dst)
+                    built[src] = dst
+                    self.append(w, f"[*] Extensions {','.join(exts)}"
+                                   f"{' + bare words' if cfg['ext_bare'] else ''}: "
+                                   f"{os.path.basename(src)} -> {n} entries ({dst})\n")
+                wls[t] = built[src]
         merged = {}   # normalized url -> {url, status, size, sources}
 
         def add(url, status, size, source):
@@ -3850,14 +3890,14 @@ class GhostReconGUI:
                 self.update_status(f"dirb -> {base} ({i}/{len(targets)})")
                 out = os.path.join(outdir, f"dirb_{tag}.txt")
                 # -v prints every word (404s too) so the live feed sees each test
-                cmd = ["dirb", base + "/", cfg["dirb_wl"], "-S", "-v", "-o", out]
+                cmd = ["dirb", base + "/", wls["dirb"], "-S", "-v", "-o", out]
                 if not cfg["recursive"]:
                     cmd.append("-r")
                 if rate:   # dirb is single-threaded, so a fixed delay == a rate cap
                     cmd += ["-z", str(max(1, 1000 // rate))]
                 if cfg["ua"]:
                     cmd += ["-a", cfg["ua"]]
-                self._feed_begin("dirb", base, self._count_words(cfg["dirb_wl"]))
+                self._feed_begin("dirb", base, self._count_words(wls["dirb"]))
                 # dirb block-buffers stdout into a pipe; force line buffering
                 if shutil.which("stdbuf"):
                     cmd = ["stdbuf", "-oL"] + cmd
@@ -3881,14 +3921,14 @@ class GhostReconGUI:
                 for h in self._all_headers():
                     if not (cfg["ua"] and h.lower().startswith("user-agent:")):
                         common += ["-H", h]
-                calib = self._ffuf_calibrate(base, common, w) if fspec["ac"] else {}
+                calib = self._ffuf_calibrate(base, common, w, exts) if fspec["ac"] else {}
                 if self.stop_requested:
                     continue
-                cmd = ["ffuf", "-u", base + "/FUZZ", "-w", cfg["ffuf_wl"], "-ic"] + common
+                cmd = ["ffuf", "-u", base + "/FUZZ", "-w", wls["ffuf"], "-ic"] + common
                 if cfg["recursive"]:
                     cmd += ["-recursion", "-recursion-depth", "2"]
                 hits = []
-                self._feed_begin("ffuf", base, self._count_words(cfg["ffuf_wl"]))
+                self._feed_begin("ffuf", base, self._count_words(wls["ffuf"]))
                 # stderr = banner + progress bar; stdout = one JSON line per response
                 self.run_stream(cmd, w, merge_stderr=False, on_line=lambda ln, b=base:
                                 self._ffuf_line(ln, b, w, add, fspec, calib, hits))
@@ -3962,6 +4002,31 @@ class GhostReconGUI:
                            f"(words {r.get('words')}, lines {r.get('lines')})\n")
 
     @staticmethod
+    def _expand_wordlist(src, exts, bare, dst):
+        """Write `src` to `dst` with each extension appended to every word
+        (word -> word.aspx, word.html; plus the bare word if `bare`). Comment
+        and blank lines are dropped, entries de-duplicated. Words ending in '/'
+        are directories, so they're kept bare and never get an extension.
+        Returns the number of entries written."""
+        seen, n = set(), 0
+        with open(src, encoding="utf-8", errors="surrogateescape") as fin, \
+                open(dst, "w", encoding="utf-8", errors="surrogateescape") as fout:
+            for line in fin:
+                word = line.strip()
+                if not word or word.startswith("#"):
+                    continue
+                if word.endswith("/"):
+                    cands = [word] if bare else []
+                else:
+                    cands = ([word] if bare else []) + [word + e for e in exts]
+                for c in cands:
+                    if c not in seen:
+                        seen.add(c)
+                        fout.write(c + "\n")
+                        n += 1
+        return n
+
+    @staticmethod
     def _ffuf_is_hit(r, fspec, calib):
         code, size = r.get("status", 0), r.get("length", 0)
         words, lines = r.get("words", 0), r.get("lines", 0)
@@ -3970,18 +4035,27 @@ class GhostReconGUI:
         if (in_ranges(code, fspec["fc"]) or in_ranges(size, fspec["fs"])
                 or in_ranges(words, fspec["fw"]) or in_ranges(lines, fspec["fl"])):
             return False
-        rule = calib.get(code)   # auto-calibration: (field, value) per status
-        if rule and r.get(rule[0]) == rule[1]:
-            return False
+        rule = calib.get(code)   # auto-calibration: (field, value(s)) per status
+        if rule:
+            vals = rule[1]
+            v = r.get(rule[0])
+            if (v in vals) if isinstance(vals, (set, frozenset)) else v == vals:
+                return False
         return True
 
-    def _ffuf_calibrate(self, base, common, w):
+    def _ffuf_calibrate(self, base, common, w, exts=()):
         """Our own -ac: request a few paths that can't exist and learn what the
         server's "not found" looks like per status code (size, else words,
         else lines). ffuf's built-in -ac can't be used because it would also
-        hide those responses from the live feed."""
+        hide those responses from the live feed.
+
+        With extensions, each one is probed too: IIS/ASP.NET typically serves
+        a different not-found page for /x.aspx than for /x, so each extension
+        gets its own signature (a code's rule may then hold several values)."""
         rnd = lambda n: "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
         probes = [rnd(8), rnd(16), rnd(32), "admin" + rnd(8), ".htaccess" + rnd(8), rnd(10) + "/"]
+        for e in exts:
+            probes += [rnd(10) + e, rnd(18) + e]
         tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
         tmp.write("\n".join(probes) + "\n")
         tmp.close()
@@ -3998,18 +4072,26 @@ class GhostReconGUI:
                             w, on_line=grab, echo=False, merge_stderr=False)
         finally:
             os.unlink(tmp.name)
+        def kind(r):   # which probe class a response belongs to ("" = bare word)
+            path = urlsplit(r.get("url", "")).path
+            return next((e for e in sorted(exts, key=len, reverse=True)
+                         if path.endswith(e)), "")
+
         by_code = {}
         for r in recs:
-            by_code.setdefault(r.get("status"), []).append(r)
+            by_code.setdefault(r.get("status"), {}).setdefault(kind(r), []).append(r)
         calib = {}
-        for code, rs in by_code.items():
+        for code, classes in by_code.items():
             for field in ("length", "words", "lines"):
-                vals = {r.get(field) for r in rs}
-                if len(vals) == 1:
-                    calib[code] = (field, vals.pop())
+                per_class = [{r.get(field) for r in rs} for rs in classes.values()]
+                if all(len(v) == 1 for v in per_class):   # stable within each class
+                    vals = set().union(*per_class)
+                    calib[code] = (field, vals.pop() if len(vals) == 1 else frozenset(vals))
                     break
         if calib:
-            desc = ", ".join(f"{c} with {f}={v}" for c, (f, v) in sorted(calib.items()))
+            def fmt(v):
+                return "/".join(map(str, sorted(v))) if isinstance(v, frozenset) else v
+            desc = ", ".join(f"{c} with {f}={fmt(v)}" for c, (f, v) in sorted(calib.items()))
             self.append(w, f"[*] Calibration: treating {desc} as not-found\n")
         else:
             self.append(w, "[!] Calibration found no stable not-found signature.\n")
