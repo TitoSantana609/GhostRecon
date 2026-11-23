@@ -28,6 +28,7 @@ import random
 import string
 import time
 import shlex
+import socket
 import sqlite3
 from urllib.parse import urlsplit, parse_qsl, quote, urlencode
 
@@ -4648,8 +4649,11 @@ class GhostReconGUI:
 
     # ---- Vhost fuzzing ---- #
     def start_vhost(self):
-        target = self.vhost_target.get().strip()
-        target = re.sub(r'^https?://', '', target).split("/")[0]
+        raw = self.vhost_target.get().strip()
+        m = re.match(r'^(https?)://', raw, re.I)
+        if m:   # an explicit scheme in the target wins over the checkbox
+            self.vhost_https.set(m.group(1).lower() == "https")
+        target = re.sub(r'^https?://', '', raw, flags=re.I).split("/")[0]
         domain = self.vhost_domain.get().strip().lstrip(".")
         wl = self.vhost_wordlist.get().strip()
         # target may carry a :port (e.g. an internal app on :8443) -> validate
@@ -4671,51 +4675,226 @@ class GhostReconGUI:
         self._launch(self.run_vhost, self.outputs["vhost"], (target, domain, wl))
 
     def run_vhost(self, target, domain, wl):
+        """Host-header vhost fuzzing with ffuf.
+
+        ffuf's own -ac isn't used: on vhost fuzzing it misfires both ways.
+        Catch-all pages that echo the Host header change size with every
+        word, and its words/lines fallback then hides real vhosts whose page
+        happens to share a word count. Instead GhostRecon probes random
+        labels of different lengths first and models the server's default
+        response per status code (incl. "size grows with the label", and the
+        redirect Location with the label masked out)."""
         w = self.outputs["vhost"]
         if not self.require(w, "ffuf"):
             return
         outdir = self.state["outdir"] or self._new_outdir(domain)
         scheme = "https" if self.vhost_https.get() else "http"
-        out = os.path.join(outdir, f"vhosts_{sanitize_for_path(domain)}.json")
-        cmd = ["ffuf", "-u", f"{scheme}://{target}/", "-w", wl,
-               "-H", f"Host: FUZZ.{domain}", "-noninteractive", "-s",
-               "-o", out, "-of", "json", "-ac", "-mc", "all"]
-        rate = self.gopts["rate"]
-        if rate:
-            cmd += ["-rate", str(rate)]
+        host, port = (target.rsplit(":", 1) if re.search(r':\d+$', target)
+                      else (target, ""))
+        port_n = int(port) if port else (443 if scheme == "https" else 80)
+
+        try:
+            ip = socket.gethostbyname(host)
+        except OSError as e:
+            self.append(w, f"[!] Could not resolve {host}: {e}\n")
+            self.update_status("Vhost fuzzing: target did not resolve.")
+            return
+        connect = target
+        if scheme == "https" and not IP_RE.match(host):
+            # ffuf sends the URL's hostname as TLS SNI for every request (its
+            # -sni can't take FUZZ). With SNI=<target> Apache answers 421 to
+            # every other Host, so connect by IP: no SNI, Host header decides.
+            connect = ip + (f":{port}" if port else "")
+            self.append(w, f"[*] HTTPS: connecting to {host} by IP ({ip}) so no SNI is "
+                           "sent — otherwise servers like Apache reply 421 to every "
+                           "other Host header.\n")
+        url = f"{scheme}://{connect}/"
+
+        common = ["-H", f"Host: FUZZ.{domain}", "-noninteractive", "-json", "-mc", "all"]
+        if self.gopts["rate"]:
+            common += ["-rate", str(self.gopts["rate"])]
         if self._proxy_url():
-            cmd += ["-x", self._proxy_url()]
+            common += ["-x", self._proxy_url()]
         for h in self._all_headers():
-            cmd += ["-H", h]
+            if not h.lower().startswith("host:"):
+                common += ["-H", h]
+
+        # --- 1) calibrate: what does an unknown vhost look like? ------------ #
+        rnd = lambda n: "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+        recs = []
+
+        def probe(labels):
+            tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+            tmp.write("\n".join(labels) + "\n")
+            tmp.close()
+            try:
+                self.run_stream(["ffuf", "-u", url, "-w", tmp.name] + common, w,
+                                echo=False, merge_stderr=False,
+                                on_line=lambda ln: self._vhost_rec(ln, domain, recs.append))
+            finally:
+                os.unlink(tmp.name)
+
+        self.append(w, f"[*] Target {url}  Host: FUZZ.{domain}\n"
+                       "[*] Calibrating with random vhosts ...\n")
+        probe([rnd(n) for n in (6, 9, 13, 18, 24, 31)])
+        if self.stop_requested:
+            return
+        if not recs:
+            self._vhost_unreachable(w, url, ip, port_n, scheme, common)
+            return
+        model = self._vhost_baseline(recs)
+        if any(not m["fit"] for m in model.values()):
+            # size isn't predictable -> sample more to learn its real range
+            probe([rnd(random.randint(5, 30)) for _ in range(24)])
+            model = self._vhost_baseline(recs)
+        for code, m in sorted(model.items()):
+            if m["fit"] and m["fit"][0]:
+                how = (f"size = {m['fit'][1]} + {m['fit'][0]}×len(label) "
+                       "(default page echoes the Host header)")
+            elif m["fit"]:
+                how = f"size {m['fit'][1]}"
+            else:
+                how = f"size varies {m['min']}–{m['max']} (dynamic page; using a range)"
+            loc = next(iter(m["loc"])) if len(m["loc"]) == 1 else ""
+            self.append(w, f"[*] Baseline [{code}]: {how}"
+                           f"{f', redirects to {loc}' if loc else ''}\n")
+
+        # --- 2) fuzz ------------------------------------------------------- #
+        total = self._count_words(wl)
+        out = os.path.join(outdir, f"vhosts_{sanitize_for_path(domain)}.txt")
+        raw = os.path.join(outdir, f"vhosts_{sanitize_for_path(domain)}.json")
         self.update_status(f"Fuzzing vhosts on {target} for *.{domain} ...")
-        self.append(w, f"[*] ffuf Host: FUZZ.{domain} -> {scheme}://{target}/  "
-                       f"(auto-calibrated)\n")
-        # ffuf deadlocks if its stderr is merged into the stdout pipe -> keep split
-        self.run_stream(cmd, w, skip_blank=True, merge_stderr=False)
-        hits = self._parse_ffuf_file(out)
+        cmd = ["ffuf", "-u", url, "-w", wl, "-ic", "-o", raw, "-of", "json"] + common
+        hits, seen = [], [0]
+        step = max(100, total // 20)
+        t0 = time.time()
+
+        def on_rec(r):
+            seen[0] += 1
+            if not self._vhost_is_baseline(r, model):
+                hits.append(r)
+                loc = f" -> {r['redirectlocation']}" if r.get("redirectlocation") else ""
+                self.append(w, f"[+] {r['host']}  [{r['status']}]  {r['length']} B{loc}\n")
+            if seen[0] % step == 0:
+                el = time.time() - t0
+                self.append(w, f"    ... {seen[0]}/{total} tested "
+                               f"({seen[0] / el if el else 0:.0f} req/s), "
+                               f"{len(hits)} hit(s)\n")
+                self.update_status(f"Vhosts: {seen[0]}/{total} tested, {len(hits)} hit(s)")
+
+        self.run_stream(cmd, w, merge_stderr=False,
+                        on_line=lambda ln: self._vhost_rec(ln, domain, on_rec))
+
+        missing = total - seen[0]
+        if missing > 0 and not self.stop_requested:
+            self.append(w, f"[!] {missing} of {total} requests got no response "
+                           "(timeouts / connection errors / rate limiting).\n")
+        if len(hits) > 25 and len(hits) > 0.2 * max(seen[0], 1):
+            self.append(w, f"[!] {len(hits)} of {seen[0]} words differ from the baseline — "
+                           "the default response isn't stable (WAF, rate limiting, "
+                           "load balancer), so these are likely noise.\n")
+        with open(out, "w") as f:
+            for r in hits:
+                f.write(f"{r['host']}\t{r['status']}\t{r['length']}\t"
+                        f"{r.get('redirectlocation', '')}\n")
         if hits:
-            self.append(w, f"\n[+] {len(hits)} candidate vhost(s):\n")
-            for label, code, size in hits:
-                self.append(w, f"  {label}.{domain}  -> [{code}] {size} B\n")
-            self.state["vhosts"] = [f"{lb}.{domain}" for lb, _, _ in hits]
+            self.append(w, f"\n[+] {len(hits)} candidate vhost(s) -> {out}\n")
+            self.state["vhosts"] = [r["host"] for r in hits]
         else:
-            self.append(w, "\n[*] No vhosts stood out from the calibrated baseline.\n")
-        self.update_status(f"Vhost fuzzing done -> {out}")
+            self.append(w, f"\n[*] No vhosts differed from the baseline "
+                           f"({seen[0]} tested).\n")
+        self.update_status(f"Vhost fuzzing done: {len(hits)} candidate(s) -> {out}")
 
     @staticmethod
-    def _parse_ffuf_file(path):
-        """Read an ffuf JSON output file -> [(label, status, length)].
-        label is the FUZZ input value when present, else the matched URL."""
+    def _vhost_rec(line, domain, sink):
+        """Parse one ffuf -json line, tag it with its vhost label, pass it on."""
         try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return []
-        out = []
-        for r in data.get("results", []):
-            label = (r.get("input", {}) or {}).get("FUZZ") or r.get("url", "")
-            out.append((label, r.get("status", ""), r.get("length", "")))
-        return out
+            r = json.loads(line)
+        except ValueError:
+            return
+        h = (r.get("host") or "").lower()
+        suffix = "." + domain.lower()
+        r["host"] = h
+        r["_label"] = h[:-len(suffix)] if h.endswith(suffix) else h
+        sink(r)
+
+    @staticmethod
+    def _vhost_loc(r):
+        """Redirect Location with the fuzzed label masked, so 'redirect to
+        https://<same host>/' compares equal across words."""
+        loc = (r.get("redirectlocation") or "").lower()
+        # mask the whole host, not the bare label ("s" would also hit "https")
+        return loc.replace(r["host"], "§") if r["host"] else loc
+
+    @classmethod
+    def _vhost_baseline(cls, recs):
+        model = {}
+        by = {}
+        for r in recs:
+            by.setdefault(r.get("status"), []).append(r)
+        for code, rs in by.items():
+            fit = None
+            for n in range(5):   # size = a + n*len(label): host echoed n times
+                a = {r.get("length", 0) - n * len(r["_label"]) for r in rs}
+                if len(a) == 1:
+                    fit = (n, a.pop())
+                    break
+            lens = [r.get("length", 0) for r in rs]
+            model[code] = {"fit": fit, "min": min(lens), "max": max(lens),
+                           "words": {r.get("words") for r in rs},
+                           "lines": {r.get("lines") for r in rs},
+                           "loc": {cls._vhost_loc(r) for r in rs}}
+        return model
+
+    @classmethod
+    def _vhost_is_baseline(cls, r, model):
+        m = model.get(r.get("status"))
+        if m is None:
+            return False                       # a status the default never gives
+        if cls._vhost_loc(r) not in m["loc"]:
+            return False                       # redirects somewhere else
+        size = r.get("length", 0)
+        if m["fit"]:
+            n, a = m["fit"]
+            return size == a + n * len(r["_label"])
+        # Dynamic default page (nonce/CSRF token/timestamp): sizes jitter but
+        # the page's shape usually doesn't. Same word+line count -> allow a
+        # wide size window; otherwise only a tight one around what was seen.
+        spread = m["max"] - m["min"]
+        pad = spread + 64 if (r.get("words") in m["words"]
+                              and r.get("lines") in m["lines"]) else max(16, spread // 2)
+        return m["min"] - pad <= size <= m["max"] + pad
+
+    def _vhost_unreachable(self, w, url, ip, port, scheme, common):
+        """Calibration got zero responses: say why instead of 'no vhosts'."""
+        try:
+            socket.create_connection((ip, port), timeout=6).close()
+        except OSError as e:
+            other = "off" if scheme == "https" else "on"
+            self.append(w, f"[!] Cannot connect to {ip}:{port} ({e}).\n"
+                           f"    Check the host/port, or turn 'Use HTTPS' {other}.\n")
+            self.update_status("Vhost fuzzing: target unreachable.")
+            return
+        # Port is open but ffuf got nothing back: surface ffuf's own error.
+        try:
+            p = subprocess.run(["ffuf", "-u", url, "-w", "-"]
+                               + [a for a in common if a != "-json"],
+                               input="ghostreconprobe\n",
+                               capture_output=True, text=True, timeout=40)
+            lines = [strip_ansi(ln).strip() for ln in
+                     (p.stderr + p.stdout).replace("\r", "\n").splitlines()]
+            errs = [ln for ln in lines if not ln.startswith("::")   # banner/progress
+                    and re.search(r'error|fail|invalid|refused|tls|x509|timeout', ln, re.I)]
+        except Exception as e:
+            errs = [str(e)]
+        self.append(w, f"[!] {ip}:{port} is open but ffuf got no HTTP response"
+                       f"{' over TLS' if scheme == 'https' else ''}.\n")
+        for ln in errs[-5:]:
+            self.append(w, f"    {ln}\n")
+        if not errs:
+            self.append(w, "    Wrong protocol? Try toggling 'Use HTTPS'. If a proxy is "
+                           "set in Settings, check that it's running.\n")
+        self.update_status("Vhost fuzzing: no response from target.")
 
     # ---- kite wordlist download ---- #
     def start_kite_download(self):
