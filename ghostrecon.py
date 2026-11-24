@@ -5056,10 +5056,19 @@ class GhostReconGUI:
         "X-Original-URL", "X-Rewrite-URL", "X-Override-URL",
         "X-Originating-URL", "X-Forwarded-Path", "Request-Uri", "Base-Url",
     ]
+    # prefix headers (reverse-proxy path prefix, e.g. Spring X-Forwarded-Prefix):
+    # each name is tried with every prefix value below.
+    BYPASS_PREFIX_HEADERS = [
+        "X-Forwarded-Prefix", "X-Forwarded-Path-Prefix",
+    ]
+    BYPASS_PREFIX_VALUES = ["/", "/..", "/..;", "/%2e%2e", "/;"]
     # method-override headers: value is set to a benign method.
     BYPASS_METHOD_HEADERS = [
         "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override",
     ]
+    # verbs tried as a direct method change (the forbidden GET may be allowed
+    # under another verb, or a HEAD/OPTIONS may leak that the resource exists).
+    BYPASS_VERBS = ("POST", "PUT", "PATCH", "TRACE", "OPTIONS", "HEAD")
 
     def start_bypass(self):
         urls = [u for u in self._lines_from(self.bypass_input) if is_url(u)]
@@ -5083,8 +5092,8 @@ class GhostReconGUI:
             mo_verbs = ("GET", "POST", "TRACE")
         else:
             ip_headers = ["X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP",
-                          "X-Client-IP", "X-Originating-IP", "X-Host",
-                          "X-Custom-IP-Authorization"]
+                          "X-Client-IP", "X-Originating-IP", "True-Client-IP",
+                          "X-Host", "X-Custom-IP-Authorization"]
             ip_values = ["127.0.0.1", "localhost", "::1"]
             mo_verbs = ("GET",)
         self.append(w, f"[*] Mode: {'thorough' if thorough else 'fast'}\n")
@@ -5135,6 +5144,14 @@ class GhostReconGUI:
                 if self.stop_requested:
                     break
                 _try(f"header {name}: {path}", url, extra_headers=[f"{name}: {path}"])
+            # prefix headers (reverse-proxy path prefix, e.g. X-Forwarded-Prefix)
+            for name in self.BYPASS_PREFIX_HEADERS:
+                if self.stop_requested:
+                    break
+                for pv in self.BYPASS_PREFIX_VALUES:
+                    if self.stop_requested:
+                        break
+                    _try(f"header {name}: {pv}", url, extra_headers=[f"{name}: {pv}"])
             # method-override headers (keep GET verb, override via header)
             for name in self.BYPASS_METHOD_HEADERS:
                 if self.stop_requested:
@@ -5143,8 +5160,8 @@ class GhostReconGUI:
                     if self.stop_requested:
                         break
                     _try(f"header {name}: {mv}", url, extra_headers=[f"{name}: {mv}"])
-            # method change
-            for method in ("POST", "PUT", "PATCH", "TRACE", "OPTIONS", "HEAD"):
+            # method change (alternative verbs)
+            for method in self.BYPASS_VERBS:
                 if self.stop_requested:
                     break
                 _try(f"method {method}", url, method=method)
